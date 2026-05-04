@@ -157,3 +157,15 @@ even when set in the config, password authentication may still be attempted if
 - No server mode
 - `IdentitiesOnly` config keyword not supported
 - Single-threaded; `open-shell` does not handle concurrent stdin/stdout
+
+# Contributing
+## Installing
+``` shell
+git clone https://github.com/jmeissen/cl-ssh
+cd cl-ssh
+qlot install
+```
+## Running tests
+``` shell
+sbcl --disable-debugger --load .qlot/setup.lisp --eval '(asdf:test-system :ssh)' --quit
+```
