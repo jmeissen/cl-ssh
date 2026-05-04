@@ -189,21 +189,14 @@
       ;; 1. Version exchange
       (send-version stream)
       (let* ((our-version    (map '(vector (unsigned-byte 8)) #'char-code +client-version-string+))
-             ;; replayed: captures server version string for offline replay
-             (server-version (jrn:replayed ("transport/server-version")
-                               (recv-version stream))))
+             (server-version (recv-version stream)))
 
         ;; 2. Build and send our KEXINIT.
-        ;;    replayed: captures the payload (including random cookie) so
-        ;;    the exchange hash is reproducible during replay.
-        (let ((our-kexinit (jrn:replayed ("transport/client-kexinit")
-                             (kexinit-payload))))
+        (let ((our-kexinit (kexinit-payload)))
           (send-packet ps our-kexinit)
 
           ;; 3. Receive server KEXINIT
-          ;;    replayed: captures the server's full KEXINIT bytes.
-          (let ((server-kexinit-payload (jrn:replayed ("transport/server-kexinit")
-                                          (recv-packet ps))))
+          (let ((server-kexinit-payload (recv-packet ps)))
             (unless (= (aref server-kexinit-payload 0) +msg-kexinit+)
               (error 'transport-error
                      :message (format nil "expected KEXINIT (20), got ~D"

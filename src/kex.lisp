@@ -18,13 +18,6 @@
 ;;;;   little-endian.  They must be reversed before encoding as SSH mpints
 ;;;;   (which are big-endian two's-complement, RFC 4251 §5).
 ;;;;
-;;;; JOURNALING:
-;;;;   The two non-deterministic operations — ephemeral key generation
-;;;;   and the network receive of the ECDH reply — are wrapped with
-;;;;   jrn:replayed.  When no WITH-JOURNALING is active these are no-ops.
-;;;;   When recording they capture the bytes; when replaying they return
-;;;;   the captured bytes so tests run offline and deterministically.
-
 (uiop:define-package ssh/kex
   (:use #:cl)
   (:import-from #:ssh/constants
@@ -185,13 +178,10 @@
    Returns a KEX-RESULT struct."
 
   ;; 1. Generate ephemeral Curve25519 keypair.
-  ;;    Wrapped in replayed so tests can replay a fixed keypair without
-  ;;    network access.  Returns a list (Q_C-bytes private-x-bytes).
-  (let* ((kp-bytes (jrn:replayed ("kex/ephemeral")
-                     (multiple-value-bind (priv pub)
-                         (ironclad:generate-key-pair :curve25519)
-                       (list (copy-seq (ironclad:curve25519-key-y pub))
-                             (copy-seq (getf (ironclad:destructure-private-key priv) :x))))))
+  (let* ((kp-bytes (multiple-value-bind (priv pub)
+                       (ironclad:generate-key-pair :curve25519)
+                     (list (copy-seq (ironclad:curve25519-key-y pub))
+                           (copy-seq (getf (ironclad:destructure-private-key priv) :x)))))
          (q-c      (coerce (first  kp-bytes) '(simple-array (unsigned-byte 8) (*))))
          (priv-x   (coerce (second kp-bytes) '(simple-array (unsigned-byte 8) (*))))
          (priv-key (ironclad:make-private-key :curve25519 :x priv-x :y q-c)))
@@ -203,9 +193,7 @@
       (send-packet packet-stream (buffer-to-octets init-buf)))
 
     ;; 3. Receive SSH_MSG_KEX_ECDH_REPLY.
-    ;;    Wrapped in replayed so tests can inject a pre-recorded reply.
-    (let* ((reply (jrn:replayed ("kex/ecdh-reply")
-                    (recv-packet packet-stream))))
+    (let* ((reply (recv-packet packet-stream)))
       (unless (= (aref reply 0) +msg-kex-ecdh-reply+)
         (error 'ssh-protocol-error
                :message (format nil "expected ECDH_REPLY (31), got ~D" (aref reply 0))))
@@ -221,20 +209,16 @@
                (k          (curve25519-bytes->mpint-integer shared-le)))
 
           ;; 5. Compute exchange hash H.
-          ;;    checked records H and signals on mismatch during replay,
-          ;;    catching any regression in hash computation.
-          (let* ((h (jrn:checked ("kex/exchange-hash" :version 1)
-                      (build-exchange-hash client-version-octets
-                                           server-version-octets
-                                           client-kexinit-payload
-                                           server-kexinit-payload
-                                           k-s-blob q-c q-s k))))
+          (let* ((h (build-exchange-hash client-version-octets
+                                          server-version-octets
+                                          client-kexinit-payload
+                                          server-kexinit-payload
+                                          k-s-blob q-c q-s k)))
 
             ;; 6. Verify server host-key signature.
             ;;    The key-verifier is expected to signal on failure.
-            ;;    A restart is available to capture the bytes for debugging.
             (restart-case
-                (jrn:checked ("kex/verify" :version 1)
+                (progn
                   (funcall key-verifier k-s-blob h sig-blob)
                   t)
               (skip-host-key-verification ()
@@ -332,11 +316,8 @@
    callers can substitute one for the other based on the negotiated algorithm."
 
   ;; 1. Generate ephemeral DH keypair.
-  ;;    Wrapped in replayed so tests can inject a fixed keypair offline.
-  ;;    Returns a list (x e) of CL integers.
-  (let* ((kp (jrn:replayed ("kex/dh-group14/keypair")
-               (let ((x (dh-group14-generate-private-key)))
-                 (list x (dh-group14-compute-public x)))))
+  (let* ((kp (let ((x (dh-group14-generate-private-key)))
+               (list x (dh-group14-compute-public x))))
          (x  (first  kp))   ; private key — never sent on the wire
          (e  (second kp)))  ; public key  — sent as mpint in KEXDH_INIT
 
@@ -347,9 +328,7 @@
       (send-packet packet-stream (buffer-to-octets init-buf)))
 
     ;; 3. Receive SSH_MSG_KEXDH_REPLY (msg type 31).
-    ;;    Wrapped in replayed so tests can inject a pre-recorded reply.
-    (let* ((reply (jrn:replayed ("kex/dh-group14/reply")
-                    (recv-packet packet-stream))))
+    (let* ((reply (recv-packet packet-stream)))
       (unless (= (aref reply 0) +msg-kex-ecdh-reply+)
         (error 'ssh-protocol-error
                :message (format nil "expected KEXDH_REPLY (31), got ~D"
@@ -369,16 +348,15 @@
         (let* ((k (dh-group14-compute-secret f x)))
 
           ;; 6. Compute exchange hash H.
-          (let* ((h (jrn:checked ("kex/dh-group14/exchange-hash" :version 1)
-                      (build-exchange-hash-dh client-version-octets
-                                              server-version-octets
-                                              client-kexinit-payload
-                                              server-kexinit-payload
-                                              k-s-blob e f k))))
+          (let* ((h (build-exchange-hash-dh client-version-octets
+                                             server-version-octets
+                                             client-kexinit-payload
+                                             server-kexinit-payload
+                                             k-s-blob e f k)))
 
             ;; 7. Verify server host-key signature.
             (restart-case
-                (jrn:checked ("kex/dh-group14/verify" :version 1)
+                (progn
                   (funcall key-verifier k-s-blob h sig-blob)
                   t)
               (skip-host-key-verification ()

@@ -8,6 +8,8 @@ Core transport, authentication, and session execution work. Use at your own risk
 
 Only `rsa` and `ed25519` host keys are currently supported.
 
+Developed in SBCL and also tested on ECL.
+
 ## Dependencies
 
 - [Ironclad](https://github.com/sharplispers/ironclad) - cryptography

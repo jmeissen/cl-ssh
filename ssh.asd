@@ -8,14 +8,12 @@
   :depends-on ("usocket"
                "ironclad"
                "trivial-gray-streams"
-               "journal"
                "ssh/ssh")
   :in-order-to ((test-op (test-op "ssh/tests"))))
 
 (defsystem "ssh/tests"
   :depends-on ("ssh"
-               "parachute"
-               "journal")
+               "parachute")
   :serial t
   :components ((:file "tests/package")
                (:file "tests/test-buffer")
@@ -23,7 +21,6 @@
                (:file "tests/test-kex")
                (:file "tests/test-kex-dh")
                (:file "tests/test-config")
-               (:file "tests/test-kex-replay")
                (:file "tests/test-keys"))
   :perform (test-op (op c)
                     (uiop:symbol-call :parachute :test :ssh/tests)))
