@@ -15,13 +15,11 @@ Developed in SBCL and also tested on ECL.
 - [Ironclad](https://github.com/sharplispers/ironclad) - cryptography
 - [usocket](https://github.com/usocket/usocket) - TCP-sockets
 - [trivial-gray-streams](https://github.com/trivial-gray-streams/trivial-gray-streams) - stream wrappers
-- [journal](https://github.com/melisgl/journal) - test logging/reporting
 - [qlot](https://github.com/fukamachi/qlot) (more or less)
 
 ## Test dependencies
 
 - [Parachute](https://codeberg.org/shinmera/parachute) - test framework
-- [journal](https://github.com/melisgl/journal) - test logging/reporting
 
 ## Installation
 
