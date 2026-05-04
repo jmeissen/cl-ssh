@@ -35,6 +35,9 @@
    #:ssh-channel-stream
    #:ssh-channel-stream-channel
    #:open-shell
+   #:shell-write-line
+   #:shell-read-line
+   #:shell-read-until
    #:open-subsystem
    ;; Env variable helper
    #:send-env))
@@ -134,6 +137,92 @@
         (ch   (ssh-channel-stream-channel    stream)))
     (ignore-errors (channel-close conn ch)))
   (call-next-method))
+
+;;;; Convenience shell I/O helpers
+
+(defun %string-to-octets (string)
+  (let ((octets (make-array (length string) :element-type '(unsigned-byte 8))))
+    (loop for ch across string
+          for i from 0
+          for code = (char-code ch)
+          do (when (> code 255)
+               (error "Cannot write non-octet character ~S to SSH shell stream" ch))
+             (setf (aref octets i) code))
+    octets))
+
+(defun %octets-to-string (octets &key (start 0) end)
+  (map 'string #'code-char (subseq octets start end)))
+
+(defun shell-write-line (stream line)
+  "Write LINE plus a newline to shell STREAM, then force output.
+
+   STREAM is the bidirectional binary stream returned by OPEN-SHELL.  LINE is
+   encoded as single-byte character codes, matching the rest of cl-ssh's
+   channel stream API."
+  (write-sequence (%string-to-octets line) stream)
+  (write-byte 10 stream)
+  (force-output stream)
+  line)
+
+(defun shell-read-line (stream &optional (eof-error-p t) eof-value)
+  "Read one newline-terminated line from shell STREAM.
+
+   Returns two values, like CL:READ-LINE: the line string with CR/LF removed,
+   and true when EOF ended a partial line."
+  (let ((octets (make-array 64 :element-type '(unsigned-byte 8)
+                               :adjustable t
+                               :fill-pointer 0)))
+    (loop for byte = (read-byte stream nil nil)
+          do (cond
+               ((null byte)
+                (cond
+                  ((plusp (length octets))
+                   (return (values (%octets-to-string octets) t)))
+                  (eof-error-p
+                   (error 'end-of-file :stream stream))
+                  (t
+                   (return (values eof-value t)))))
+               ((= byte 10)
+                (let ((end (length octets)))
+                  (when (and (plusp end) (= (aref octets (1- end)) 13))
+                    (decf end))
+                  (return (values (%octets-to-string octets :end end) nil))))
+               (t
+                (vector-push-extend byte octets))))))
+
+(defun shell-read-until (stream marker &key include-marker (eof-error-p t))
+  "Read from shell STREAM until MARKER is seen.
+
+   Returns two values: the accumulated string and true if MARKER was found.
+   By default the returned string excludes MARKER; pass :INCLUDE-MARKER T to
+   keep it.  If EOF occurs first, signal END-OF-FILE unless EOF-ERROR-P is NIL,
+   in which case the accumulated string and NIL are returned."
+  (let* ((marker-octets (%string-to-octets marker))
+         (marker-length (length marker-octets))
+         (octets (make-array 128 :element-type '(unsigned-byte 8)
+                                  :adjustable t
+                                  :fill-pointer 0)))
+    (when (zerop marker-length)
+      (error "MARKER must not be empty"))
+    (labels ((marker-present-p ()
+               (let ((start (- (length octets) marker-length)))
+                 (and (>= start 0)
+                      (loop for i below marker-length
+                            always (= (aref octets (+ start i))
+                                      (aref marker-octets i)))))))
+      (loop for byte = (read-byte stream nil nil)
+            do (cond
+                 ((null byte)
+                  (if eof-error-p
+                      (error 'end-of-file :stream stream)
+                      (return (values (%octets-to-string octets) nil))))
+                 (t
+                  (vector-push-extend byte octets)
+                  (when (marker-present-p)
+                    (let ((end (if include-marker
+                                   (length octets)
+                                   (- (length octets) marker-length))))
+                      (return (values (%octets-to-string octets :end end) t))))))))))
 
 ;;;; PTY request helper
 

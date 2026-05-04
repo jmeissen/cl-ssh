@@ -86,7 +86,7 @@ When you need explicit control over the connection lifetime, use `connect` and
 
 ### Sending and receiving commands
 #### run-command
-
+Single command execution.
 ```lisp
 (multiple-value-bind (stdout stderr exit-code)
     (ssh:run-command client "ls -la /tmp")
@@ -94,14 +94,24 @@ When you need explicit control over the connection lifetime, use `connect` and
 ```
 
 #### open-shell
-
+Interactive shell.
 ```lisp
-(multiple-value-bind (stream channel)
-    (ssh:open-shell client :pty t)
-  (write-sequence (map '(vector (unsigned-byte 8)) #'char-code "ls\n") stream)
-  (force-output stream)
-  ...)
+(ssh:with-connection (client "my_host")
+  (ssh:with-open-shell (shell client :pty nil)
+    (ssh:shell-write-line shell "cd /tmp")
+    (ssh:shell-write-line shell "pwd; printf '\\n__DONE__\\n'")
+    (format t "~A" (ssh:shell-read-until shell "__DONE__"))))
 ```
+
+`open-shell` itself still returns `(values stream channel)` for callers that
+need direct channel access.  The helper functions operate on the returned binary
+stream and hide the string/octet conversion for common interactive-shell use.
+
+Use `:pty nil` for scripted shell interaction like the example above.  A PTY is
+for terminal-oriented programs; with `:pty t`, servers commonly add prompts,
+echo typed commands, translate line endings, and emit terminal control sequences.
+Those bytes are returned as normal shell output, so marker-based reads may still
+work but the captured text is not machine-clean.
 
 #### open-subsystem
 

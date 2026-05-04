@@ -43,7 +43,10 @@
                 #:auth-error)
   (:import-from #:ssh/session
                 #:ssh-channel-stream
-                #:ssh-channel-stream-channel)
+                #:ssh-channel-stream-channel
+                #:shell-write-line
+                #:shell-read-line
+                #:shell-read-until)
   (:import-from #:ssh/connection
                 #:channel-stdout-buffer
                 #:channel-stderr-buffer
@@ -67,6 +70,10 @@
    #:run-command
    ;; Interactive shell
    #:open-shell
+   #:with-open-shell
+   #:shell-write-line
+   #:shell-read-line
+   #:shell-read-until
    ;; Subsystem
    #:open-subsystem
    ;; Gray stream type (for typecase etc.)
@@ -187,7 +194,9 @@ by DISCONNECT itself is suppressed so it does not shadow a condition from BODY."
 (defun open-shell (client &key pty (pty-term "xterm") (pty-cols 80) (pty-rows 24)
                             environment)
   "Open an interactive shell session on CLIENT.
-   PTY — request a pseudo-terminal (recommended for interactive use).
+   PTY — request a pseudo-terminal for terminal-oriented programs.  Leave it NIL
+         for scripted reads; PTYs may add prompts, echo, CR/LF translation, and
+         terminal control sequences.
    Returns (values bidirectional-stream channel)."
   (ssh/session:open-shell (client-transport client)
                           :pty pty
@@ -195,6 +204,16 @@ by DISCONNECT itself is suppressed so it does not shadow a condition from BODY."
                           :pty-cols pty-cols
                           :pty-rows pty-rows
                           :environment environment))
+
+(defmacro with-open-shell ((stream client &rest open-shell-args) &body body)
+  "Open an interactive shell stream for CLIENT and close it on exit."
+  (let ((channel (gensym "CHANNEL")))
+    `(multiple-value-bind (,stream ,channel)
+         (open-shell ,client ,@open-shell-args)
+       (declare (ignore ,channel))
+       (unwind-protect
+            (progn ,@body)
+         (ignore-errors (close ,stream))))))
 
 (defun open-subsystem (client subsystem-name)
   "Open a named subsystem on CLIENT (e.g. \"sftp\").
