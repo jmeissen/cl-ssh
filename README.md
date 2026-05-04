@@ -88,9 +88,10 @@ When you need explicit control over the connection lifetime, use `connect` and
 #### run-command
 Single command execution.
 ```lisp
-(multiple-value-bind (stdout stderr exit-code)
-    (ssh:run-command client "ls -la /tmp")
-  (format t "~A" stdout))
+(ssh:with-connection (client "my_host")
+  (multiple-value-bind (stdout stderr exit-code)
+      (ssh:run-command client "ls -la /tmp")
+    (format t "~A" stdout)))
 ```
 
 #### open-shell
