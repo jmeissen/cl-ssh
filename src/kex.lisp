@@ -203,42 +203,47 @@
              (q-s      (read-string* rbuf))  ; server ephemeral public key (32 bytes LE)
              (sig-blob (read-string* rbuf))) ; signature blob
 
+        ;; RFC 8731 §3: Curve25519 public keys are exactly 32 bytes.
+        (unless (= (length q-s) 32)
+          (error 'ssh-protocol-error
+                 :message (format nil "server Curve25519 public key has invalid length ~D" (length q-s))))
+
         ;; 4. Compute shared secret K
         (let* ((server-pub (ironclad:make-public-key :curve25519 :y q-s))
-               (shared-le  (ironclad:diffie-hellman priv-key server-pub))
-               (k          (curve25519-bytes->mpint-integer shared-le)))
+               (shared-le  (ironclad:diffie-hellman priv-key server-pub)))
 
-          ;; 5. Compute exchange hash H.
-          (let* ((h (build-exchange-hash client-version-octets
-                                          server-version-octets
-                                          client-kexinit-payload
-                                          server-kexinit-payload
-                                          k-s-blob q-c q-s k)))
+          ;; RFC 8731 §3 requires aborting on all-zero X25519 output.
+          (when (every #'zerop shared-le)
+            (error 'ssh-protocol-error
+                   :message "server Curve25519 public key produced an all-zero shared secret"))
 
-            ;; 6. Verify server host-key signature.
-            ;;    The key-verifier is expected to signal on failure.
-            (restart-case
-                (progn
-                  (funcall key-verifier k-s-blob h sig-blob)
-                  t)
-              (skip-host-key-verification ()
-                :report "Skip host-key signature verification (DANGEROUS — debug only)"
-                nil))
+          (let ((k (curve25519-bytes->mpint-integer shared-le)))
 
-            ;; 7. First exchange: H becomes the session identifier
-            (let ((sid (or session-id h)))
+            ;; 5. Compute exchange hash H.
+            (let* ((h (build-exchange-hash client-version-octets
+                                           server-version-octets
+                                           client-kexinit-payload
+                                           server-kexinit-payload
+                                           k-s-blob q-c q-s k)))
 
-              ;; 8. Derive six symmetric keys
-              (make-kex-result
-               :session-id    sid
-               :shared-secret k
-               :exchange-hash h
-               :iv-c2s  (derive-key k h #\A sid iv-length)
-               :iv-s2c  (derive-key k h #\B sid iv-length)
-               :key-c2s (derive-key k h #\C sid cipher-key-length)
-               :key-s2c (derive-key k h #\D sid cipher-key-length)
-               :mac-c2s (derive-key k h #\E sid mac-key-length)
-               :mac-s2c (derive-key k h #\F sid mac-key-length)))))))))
+              ;; 6. Verify server host-key signature.
+              ;;    The key-verifier is expected to signal on failure.
+              (funcall key-verifier k-s-blob h sig-blob)
+
+              ;; 7. First exchange: H becomes the session identifier
+              (let ((sid (or session-id h)))
+
+                ;; 8. Derive six symmetric keys
+                (make-kex-result
+                 :session-id    sid
+                 :shared-secret k
+                 :exchange-hash h
+                 :iv-c2s  (derive-key k h #\A sid iv-length)
+                 :iv-s2c  (derive-key k h #\B sid iv-length)
+                 :key-c2s (derive-key k h #\C sid cipher-key-length)
+                 :key-s2c (derive-key k h #\D sid cipher-key-length)
+                 :mac-c2s (derive-key k h #\E sid mac-key-length)
+                 :mac-s2c (derive-key k h #\F sid mac-key-length))))))))))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; DH Group 14 — diffie-hellman-group14-sha256 (RFC 4253 §8, RFC 3526 §3)
@@ -355,13 +360,7 @@
                                              k-s-blob e f k)))
 
             ;; 7. Verify server host-key signature.
-            (restart-case
-                (progn
-                  (funcall key-verifier k-s-blob h sig-blob)
-                  t)
-              (skip-host-key-verification ()
-                :report "Skip host-key signature verification (DANGEROUS — debug only)"
-                nil))
+            (funcall key-verifier k-s-blob h sig-blob)
 
             ;; 8. First exchange: H becomes the session identifier.
             (let ((sid (or session-id h)))

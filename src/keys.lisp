@@ -183,6 +183,7 @@
    is available to inspect the raw bytes before unwinding."
   (let* ((key-info  (parse-public-key-blob host-key-blob))
          (key       (getf key-info :key))
+         (key-type  (getf key-info :type))
          (sig-info  (parse-signature-blob sig-blob))
          (sig-algo  (getf sig-info :algorithm))
          (sig-bytes (getf sig-info :bytes)))
@@ -207,26 +208,44 @@
                            (hex exchange-hash)
                            (hex sig-bytes 16)     (length sig-bytes))
                    (finish-output *error-output*))
-                 (error 'key-error :message msg)))))
-    (cond
-      ;; Ed25519
-      ((string= sig-algo +host-key-ed25519+)
-       (unless (ironclad:verify-signature key exchange-hash sig-bytes)
-         (fail "Ed25519 host key signature verification failed")))
+                 (error 'key-error :message msg))))
+           (compatible-key-type-p ()
+             (cond
+               ((string= sig-algorithm +host-key-ed25519+)
+                (string= key-type +host-key-ed25519+))
+               ((or (string= sig-algorithm +host-key-rsa-sha2-256+)
+                    (string= sig-algorithm +host-key-rsa-sha2-512+))
+                ;; RFC 8332 reuses the "ssh-rsa" public key format for
+                ;; rsa-sha2-* host-key algorithms.
+                (string= key-type "ssh-rsa"))
+               (t nil))))
+      (unless (string= sig-algo sig-algorithm)
+        (error 'key-error
+               :message (format nil "signature algorithm mismatch: negotiated ~S, received ~S"
+                                sig-algorithm sig-algo)))
+      (unless (compatible-key-type-p)
+        (error 'key-error
+               :message (format nil "host key type ~S is not compatible with negotiated algorithm ~S"
+                                key-type sig-algorithm)))
+      (cond
+        ;; Ed25519
+        ((string= sig-algorithm +host-key-ed25519+)
+         (unless (ironclad:verify-signature key exchange-hash sig-bytes)
+           (fail "Ed25519 host key signature verification failed")))
 
-      ;; RSA-SHA256
-      ((string= sig-algo +host-key-rsa-sha2-256+)
-       (unless (rsa-pkcs1-verify key exchange-hash sig-bytes :sha256)
-         (fail "rsa-sha2-256 host key signature verification failed")))
+        ;; RSA-SHA256
+        ((string= sig-algorithm +host-key-rsa-sha2-256+)
+         (unless (rsa-pkcs1-verify key exchange-hash sig-bytes :sha256)
+           (fail "rsa-sha2-256 host key signature verification failed")))
 
-      ;; RSA-SHA512
-      ((string= sig-algo +host-key-rsa-sha2-512+)
-       (unless (rsa-pkcs1-verify key exchange-hash sig-bytes :sha512)
-         (fail "rsa-sha2-512 host key signature verification failed")))
+        ;; RSA-SHA512
+        ((string= sig-algorithm +host-key-rsa-sha2-512+)
+         (unless (rsa-pkcs1-verify key exchange-hash sig-bytes :sha512)
+           (fail "rsa-sha2-512 host key signature verification failed")))
 
-      (t
-       (error 'key-error
-              :message (format nil "unsupported signature algorithm: ~S" sig-algo)))))))
+        (t
+         (error 'key-error
+                :message (format nil "unsupported signature algorithm: ~S" sig-algorithm)))))))
 
 ;;;; Passphrase-protected key decryption helpers
 

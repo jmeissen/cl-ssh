@@ -24,6 +24,7 @@
   (:import-from :ssh/keys
                 #:load-private-key
                 #:sign-auth-data
+                #:verify-host-key-signature
                 #:key-error
                 #:key-needs-passphrase))
 
@@ -47,6 +48,22 @@
 
 (defun public-key (key-info)
   (getf key-info :public-key))
+
+(defun host-key-blob (wire-key-type public-key)
+  "Build a server host-key blob with WIRE-KEY-TYPE as the embedded key type."
+  (let ((buf (ssh/buffer:make-write-buffer)))
+    (ssh/buffer:write-string* buf wire-key-type)
+    (cond
+      ((string= wire-key-type "ssh-ed25519")
+       (ssh/buffer:write-string* buf (ironclad:ed25519-key-y public-key)))
+      ((or (string= wire-key-type "ssh-rsa")
+           (string= wire-key-type "rsa-sha2-256")
+           (string= wire-key-type "rsa-sha2-512"))
+       (ssh/buffer:write-mpint buf (ironclad:rsa-key-exponent public-key))
+       (ssh/buffer:write-mpint buf (ironclad:rsa-key-modulus public-key)))
+      (t
+       (error "unsupported test key type: ~S" wire-key-type)))
+    (ssh/buffer:buffer-to-octets buf)))
 
 ;;;; ---- Unencrypted keys (regression guard) --------------------------------
 
@@ -208,3 +225,58 @@
          (raw-sig     (ssh/buffer:read-string* sig-buf))
          (digest-name (if (string= algo "rsa-sha2-512") :sha512 :sha256)))
     (true (ssh/keys::rsa-pkcs1-verify (public-key k) message raw-sig digest-name))))
+
+;;;; ---- Host-key signature verification -------------------------------------
+
+(define-test verify-host-key-signature-ed25519-valid
+  :parent (:ssh/tests ssh/tests)
+  "A matching negotiated Ed25519 algorithm, key blob, and signature is accepted."
+  (let* ((k (load-private-key (fixture "id_ed25519_nopass")))
+         (h (map '(vector (unsigned-byte 8)) #'char-code "host key exchange hash"))
+         (key-blob (host-key-blob "ssh-ed25519" (public-key k)))
+         (sig-blob (sign-auth-data k h)))
+    (true (progn
+            (verify-host-key-signature "ssh-ed25519" key-blob h sig-blob)
+            t))))
+
+(define-test verify-host-key-signature-rsa-sha2-valid
+  :parent (:ssh/tests ssh/tests)
+  "rsa-sha2-* signatures use the RFC 8332 ssh-rsa public key wire format."
+  (let* ((k (load-private-key (fixture "id_rsa_nopass")))
+         (h (map '(vector (unsigned-byte 8)) #'char-code "rsa host key exchange hash"))
+         (key-blob (host-key-blob "ssh-rsa" (public-key k)))
+         (sig-blob (sign-auth-data k h)))
+    (true (progn
+            (verify-host-key-signature "rsa-sha2-256" key-blob h sig-blob)
+            t))))
+
+(define-test verify-host-key-signature-rejects-algorithm-mismatch
+  :parent (:ssh/tests ssh/tests)
+  "The server-controlled signature algorithm must match negotiation."
+  (let* ((k (load-private-key (fixture "id_ed25519_nopass")))
+         (h (map '(vector (unsigned-byte 8)) #'char-code "mismatch hash"))
+         (key-blob (host-key-blob "ssh-ed25519" (public-key k)))
+         (sig-blob (sign-auth-data k h)))
+    (fail (verify-host-key-signature "rsa-sha2-256" key-blob h sig-blob)
+          'key-error)))
+
+(define-test verify-host-key-signature-rejects-ed25519-key-type-mismatch
+  :parent (:ssh/tests ssh/tests)
+  "Negotiated Ed25519 cannot be satisfied by an RSA host-key blob."
+  (let* ((ed (load-private-key (fixture "id_ed25519_nopass")))
+         (rsa (load-private-key (fixture "id_rsa_nopass")))
+         (h (map '(vector (unsigned-byte 8)) #'char-code "ed key type mismatch"))
+         (key-blob (host-key-blob "ssh-rsa" (public-key rsa)))
+         (sig-blob (sign-auth-data ed h)))
+    (fail (verify-host-key-signature "ssh-ed25519" key-blob h sig-blob)
+          'key-error)))
+
+(define-test verify-host-key-signature-rejects-rsa-sha2-key-format-name
+  :parent (:ssh/tests ssh/tests)
+  "RFC 8332 rsa-sha2-* host keys must carry the ssh-rsa public key format name."
+  (let* ((k (load-private-key (fixture "id_rsa_nopass")))
+         (h (map '(vector (unsigned-byte 8)) #'char-code "rsa key type mismatch"))
+         (key-blob (host-key-blob "rsa-sha2-256" (public-key k)))
+         (sig-blob (sign-auth-data k h)))
+    (fail (verify-host-key-signature "rsa-sha2-256" key-blob h sig-blob)
+          'key-error)))

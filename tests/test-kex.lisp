@@ -8,13 +8,55 @@
                 #:kex-result-iv-c2s #:kex-result-iv-s2c
                 #:kex-result-key-c2s #:kex-result-key-s2c
                 #:kex-result-mac-c2s #:kex-result-mac-s2c
-                #:kex-result-session-id))
+                #:kex-result-session-id
+                #:perform-kex-curve25519
+                #:perform-kex-dh-group14))
 
 (in-package :ssh/tests/kex)
 
 (defun reverse-octets (v)   (ssh/kex::reverse-octets v))
 (defun curve25519->integer (le) (ssh/kex::curve25519-bytes->mpint-integer le))
 (defun derive-key (k h letter sid n) (ssh/kex::derive-key k h letter sid n))
+
+(defparameter *test-v-c* (map '(vector (unsigned-byte 8)) #'char-code "SSH-2.0-test-client"))
+(defparameter *test-v-s* (map '(vector (unsigned-byte 8)) #'char-code "SSH-2.0-test-server"))
+(defparameter *test-i-c* (octets 20 1 2 3 4))
+(defparameter *test-i-s* (octets 20 5 6 7 8))
+
+(defun ecdh-reply (q-s)
+  (let ((buf (ssh/buffer:make-write-buffer)))
+    (ssh/buffer:write-byte* buf 31)
+    (ssh/buffer:write-string* buf (octets 1 2 3))
+    (ssh/buffer:write-string* buf q-s)
+    (ssh/buffer:write-string* buf (octets 4 5 6))
+    (ssh/buffer:buffer-to-octets buf)))
+
+(defun dh-reply (f)
+  (let ((buf (ssh/buffer:make-write-buffer)))
+    (ssh/buffer:write-byte* buf 31)
+    (ssh/buffer:write-string* buf (octets 1 2 3))
+    (ssh/buffer:write-mpint buf f)
+    (ssh/buffer:write-string* buf (octets 4 5 6))
+    (ssh/buffer:buffer-to-octets buf)))
+
+(defun call-kex-with-reply (function reply key-verifier)
+  (let ((orig-send (symbol-function 'ssh/packet:send-packet))
+        (orig-recv (symbol-function 'ssh/packet:recv-packet)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'ssh/packet:send-packet)
+                 (lambda (&rest args)
+                   (declare (ignore args))
+                   0))
+           (setf (symbol-function 'ssh/packet:recv-packet)
+                 (lambda (&rest args)
+                   (declare (ignore args))
+                   reply))
+           (funcall function nil
+                    *test-v-c* *test-v-s* *test-i-c* *test-i-s* nil
+                    key-verifier))
+      (setf (symbol-function 'ssh/packet:send-packet) orig-send)
+      (setf (symbol-function 'ssh/packet:recv-packet) orig-recv))))
 
 ;;; ---- reverse-octets ----------------------------------------------------
 
@@ -137,3 +179,65 @@
       (let* ((shared (ironclad:diffie-hellman priv-a pub-b))
              (k      (curve25519->integer shared)))
         (true (>= k 0))))))
+
+;;; ---- KEX protocol rejection paths ----------------------------------------
+
+(define-test curve25519-kex-rejects-short-server-public-key
+  :parent (:ssh/tests ssh/tests)
+  "RFC 8731 requires received Curve25519 public keys to be exactly 32 bytes."
+  (let ((called-verifier nil))
+    (fail (call-kex-with-reply
+           #'perform-kex-curve25519
+           (ecdh-reply (octets 1 2 3))
+           (lambda (&rest args)
+             (declare (ignore args))
+             (setf called-verifier t)))
+          'ssh/packet:ssh-protocol-error)
+    (false called-verifier)))
+
+(define-test curve25519-kex-rejects-all-zero-shared-secret
+  :parent (:ssh/tests ssh/tests)
+  "RFC 8731 requires aborting when X25519 produces an all-zero shared secret."
+  (let ((called-verifier nil)
+        (orig-dh (symbol-function 'ironclad:diffie-hellman))
+        (server-public (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element 0)))
+    (setf (aref server-public 0) 9)
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'ironclad:diffie-hellman)
+                 (lambda (&rest args)
+                   (declare (ignore args))
+                   (make-array 32 :element-type '(unsigned-byte 8)
+                                  :initial-element 0)))
+           (fail (call-kex-with-reply
+                  #'perform-kex-curve25519
+                  (ecdh-reply server-public)
+                  (lambda (&rest args)
+                    (declare (ignore args))
+                    (setf called-verifier t)))
+                 'ssh/packet:ssh-protocol-error))
+      (setf (symbol-function 'ironclad:diffie-hellman) orig-dh))
+    (false called-verifier)))
+
+(define-test dh-kex-verifier-error-cannot-be-skipped
+  :parent (:ssh/tests ssh/tests)
+  "A host-key verifier error must abort KEX; no restart may bypass it."
+  (let ((result
+          (handler-case
+              (handler-bind
+                  ((error (lambda (e)
+                            (declare (ignore e))
+                            (let ((restart (find-restart 'ssh/kex::skip-host-key-verification)))
+                              (when restart
+                                (invoke-restart restart))))))
+                (call-kex-with-reply
+                 #'perform-kex-dh-group14
+                 (dh-reply 2)
+                 (lambda (&rest args)
+                   (declare (ignore args))
+                   (error "verifier failed")))
+                :unexpected-success)
+            (simple-error () :verifier-error)
+            (error () :other-error))))
+    (is eq :verifier-error result)))
