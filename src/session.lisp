@@ -261,7 +261,7 @@
     (unless (channel-open-p ch)
       (error 'connection-error :message "server refused to open session channel"))
     ;; Send environment variables
-    (dolist (pair (or environment '()))
+    (dolist (pair environment)
       (send-env conn ch (car pair) (cdr pair)))
     ;; Send exec request
     (let ((extra (make-write-buffer)))
@@ -308,7 +308,7 @@
          (ch   (open-channel conn +channel-session+)))
     (unless (channel-open-p ch)
       (error 'connection-error :message "server refused to open session channel"))
-    (dolist (pair (or environment '()))
+    (dolist (pair environment)
       (send-env conn ch (car pair) (cdr pair)))
     (when pty
       (unless (request-pty conn ch :term pty-term :cols pty-cols :rows pty-rows)
