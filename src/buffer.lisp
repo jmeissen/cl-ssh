@@ -35,7 +35,8 @@
    #:read-name-list
    #:read-remaining-bytes
    #:read-buffer-length
-   #:read-buffer-pos))
+   #:read-buffer-pos
+   #:utf-8-to-octets))
 
 (in-package #:ssh/buffer)
 
@@ -56,6 +57,10 @@
                      (buffer-format-error-message c)))))
 
 ;;;; Helpers
+
+(defun utf-8-to-octets (string)
+  "Convert STRING to a vector of UTF-8 encoded octets."
+  (babel:string-to-octets string :encoding :utf-8))
 
 (defun ascii-to-octets (string)
   "Encode STRING as ASCII octets.  Signals an error on non-ASCII characters."

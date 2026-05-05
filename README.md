@@ -15,6 +15,7 @@ Developed in SBCL and also tested on ECL.
 - [Ironclad](https://github.com/sharplispers/ironclad) - cryptography
 - [usocket](https://github.com/usocket/usocket) - TCP-sockets
 - [trivial-gray-streams](https://github.com/trivial-gray-streams/trivial-gray-streams) - stream wrappers
+- [babel](https://github.com/cl-babel/babel) - UTF-8 string to octet support
 - [qlot](https://github.com/fukamachi/qlot) (more or less)
 
 ## Test dependencies

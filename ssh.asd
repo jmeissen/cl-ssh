@@ -8,6 +8,7 @@
   :depends-on ("usocket"
                "ironclad"
                "trivial-gray-streams"
+               "babel"
                "ssh/ssh")
   :in-order-to ((test-op (test-op "ssh/tests"))))
 

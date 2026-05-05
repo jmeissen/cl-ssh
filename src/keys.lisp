@@ -24,10 +24,20 @@
                 #:+host-key-rsa-sha2-256+
                 #:+host-key-rsa-sha2-512+)
   (:import-from #:ssh/buffer
-                #:make-read-buffer #:read-byte* #:read-uint32 #:read-string*
-                #:read-mpint #:read-remaining-bytes
-                #:make-write-buffer #:write-string* #:write-mpint #:write-uint32
-                #:write-byte* #:write-raw-bytes #:buffer-to-octets)
+                #:make-read-buffer
+                #:read-byte*
+                #:read-uint32
+                #:read-string*
+                #:read-mpint
+                #:read-remaining-bytes
+                #:make-write-buffer
+                #:write-string*
+                #:write-mpint
+                #:write-uint32
+                #:write-byte*
+                #:write-raw-bytes
+                #:buffer-to-octets
+                #:utf-8-to-octets)
   (:export
    ;; Host key verification (called by kex layer)
    #:verify-host-key-signature
@@ -275,12 +285,6 @@
                                 (supported: aes128-ctr, aes256-ctr, aes128-cbc, aes256-cbc)"
                                cipher-name)))))
 
-(defun passphrase-to-octets (passphrase)
-  "Convert a passphrase string to a UTF-8 octet vector.
-   Each character is encoded as its char-code (correct for ASCII and
-   Latin-1 passphrases; full Unicode support would require a UTF-8 encoder)."
-  (map '(vector (unsigned-byte 8)) #'char-code passphrase))
-
 (defun bcrypt-pbkdf-derive (passphrase-octets salt rounds total-bytes)
   "Derive TOTAL-BYTES of key material from PASSPHRASE-OCTETS using
    OpenSSH's bcrypt_pbkdf (salt bytes SALT, ROUNDS iterations).
@@ -415,7 +419,7 @@
                      (multiple-value-bind (key-len iv-len)
                          (openssh-cipher-key-iv-lengths cipher-name)
                        (let* ((key-mat (bcrypt-pbkdf-derive
-                                        (passphrase-to-octets passphrase)
+                                        (utf-8-to-octets passphrase)
                                         salt rounds (+ key-len iv-len)))
                               (key (subseq key-mat 0 key-len))
                               (iv  (subseq key-mat key-len (+ key-len iv-len))))

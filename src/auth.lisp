@@ -24,13 +24,25 @@
                 #:+auth-password+
                 #:+auth-publickey+)
   (:import-from #:ssh/buffer
-                #:make-write-buffer #:write-byte* #:write-boolean #:write-string*
-                #:write-raw-bytes #:buffer-to-octets
-                #:make-read-buffer #:read-byte* #:read-string* #:read-boolean)
+                #:make-write-buffer
+                #:write-byte*
+                #:write-boolean
+                #:write-string*
+                #:write-raw-bytes
+                #:buffer-to-octets
+                #:make-read-buffer
+                #:read-byte*
+                #:read-string*
+                #:read-boolean
+                #:utf-8-to-octets)
   (:import-from #:ssh/transport
-                #:transport #:transport-send #:transport-recv #:transport-session-id)
+                #:transport
+                #:transport-send
+                #:transport-recv
+                #:transport-session-id)
   (:import-from #:ssh/keys
-                #:load-private-key #:sign-auth-data)
+                #:load-private-key
+                #:sign-auth-data)
   (:export
    #:authenticate
    #:auth-error))
@@ -105,7 +117,7 @@
     (write-string* buf +service-connection+)
     (write-string* buf +auth-password+)
     (write-boolean buf nil)           ; FALSE — not a password-change request
-    (write-string* buf (map '(vector (unsigned-byte 8)) #'char-code password))
+    (write-string* buf (utf-8-to-octets password))
     (transport-send transport (buffer-to-octets buf)))
   (let ((reply (recv-auth-response transport)))
     (case (aref reply 0)
