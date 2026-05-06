@@ -24,12 +24,15 @@ Developed in SBCL and also tested on ECL.
 
 ## Installation
 
-```bash
-qlot add github jmeissen/cl-ssh
-```
+This package is not available in quicklisp. However, it is available in
+[Ultralisp](https://ultralisp.org), which makes loading the package as easy as:
 
 ```lisp
 (ql:quickload :ssh)
+```
+For project-local versioning with Qlot, you could use:
+``` shell
+qlot add ultralisp jmeissen-cl-ssh
 ```
 
 ## Usage
