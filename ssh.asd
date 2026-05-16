@@ -23,6 +23,7 @@
                 (:file "tests/test-kex-dh")
                 (:file "tests/test-known-hosts")
                 (:file "tests/test-config")
+                (:file "tests/test-transport")
                 (:file "tests/test-keys"))
   :perform (test-op (op c)
                     (uiop:symbol-call :parachute :test :ssh/tests)))

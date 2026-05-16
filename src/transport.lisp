@@ -134,23 +134,59 @@
 
 (defun recv-version (stream)
   "Read the server's SSH identification string.
-   Skips lines that do not start with SSH-2.0 (pre-banner lines are allowed
-   by RFC 4253 §4.2 as long as they do not start with 'SSH-').
+   Skips pre-banner lines.
+   Accepts SSH-2.0 and SSH-1.99 compatibility identification strings.
    Returns the version string without CRLF as an octet vector."
-  (loop
-    (let ((line (with-output-to-string (s)
-                  (loop for byte = (read-byte stream)
-                        for char = (code-char byte)
-                        until (char= char #\Newline)
-                        unless (char= char #\Return)
-                          do (write-char char s)))))
-      (when (and (>= (length line) 7)
-                 (string= (subseq line 0 4) "SSH-"))
-        (unless (string= (subseq line 0 8) "SSH-2.0-")
-          (error 'transport-error
-                 :message (format nil "server requires SSH protocol ~A; only 2.0 is supported"
-                                  (subseq line 4 (position #\- line :start 4)))))
-        (return (map '(vector (unsigned-byte 8)) #'char-code line))))))
+  (let ((limit 254)) ; RFC 4253 caps the identification string at 255 chars incl. CRLF.
+    (labels ((ssh-prefix-p (line)
+               (and (= (length line) 4)
+                    (char= (aref line 0) #\S)
+                    (char= (aref line 1) #\S)
+                    (char= (aref line 2) #\H)
+                    (char= (aref line 3) #\-)))
+             (read-line* ()
+               (let ((line (make-array 32 :element-type 'character
+                                           :adjustable t :fill-pointer 0))
+                     (line-kind :unknown)
+                     (count 0))
+                 (loop for byte = (read-byte stream)
+                       for char = (code-char byte)
+                       do (cond
+                            ((char= char #\Newline)
+                             (return (values (coerce line 'string) line-kind)))
+                            ((char= char #\Return)
+                             (incf count)
+                             (when (and (eq line-kind :ssh)
+                                        (> count limit))
+                               (error 'transport-error
+                                      :message "server sent an overlong SSH identification string")))
+                            (t
+                             (incf count)
+                             (case line-kind
+                               (:ssh
+                                (when (> count limit)
+                                  (error 'transport-error
+                                         :message "server sent an overlong SSH identification string"))
+                                (vector-push-extend char line))
+                               (:banner
+                                nil)
+                               (:unknown
+                                (vector-push-extend char line)
+                                (when (= (length line) 4)
+                                  (setf line-kind (if (ssh-prefix-p line)
+                                                      :ssh
+                                                      :banner)))))))))))
+      (loop
+        (multiple-value-bind (line line-kind)
+            (read-line*)
+          (when (eq line-kind :ssh)
+            (let* ((protocol-end (position #\- line :start 4))
+                   (protocol (and protocol-end (subseq line 4 protocol-end))))
+              (unless (member protocol '("2.0" "1.99") :test #'string=)
+                (error 'transport-error
+                       :message (format nil "server requires SSH protocol 2.0 or 1.99; got ~A"
+                                        (or protocol line)))))
+            (return (map '(vector (unsigned-byte 8)) #'char-code line))))))))
 
 ;;;; Disconnect helper
 
