@@ -172,11 +172,52 @@
                           :if-does-not-exist :create)
     (format f "~A ~A ~A~%" hostname key-type (base64-encode key-blob))))
 
+(defun known-hosts-entry->line (entry)
+  "Render ENTRY back to a known_hosts line."
+  (format nil "~A ~A ~A~@[ ~A~]"
+          (known-hosts-entry-raw-hostname entry)
+          (known-hosts-entry-key-type entry)
+          (base64-encode (known-hosts-entry-key-blob entry))
+          (known-hosts-entry-comment entry)))
+
+(defun update-known-hosts (path hostname key-type key-blob)
+  "Rewrite matching known_hosts entries at PATH with KEY-BLOB."
+  (let ((staging (merge-pathnames
+                  (format nil ".~A.tmp" (gensym "KNOWN-HOSTS-"))
+                  path)))
+    (unwind-protect
+         (progn
+           (with-open-file (in path :direction :input)
+             (with-open-file (out staging :direction :output
+                                          :if-exists :supersede
+                                          :if-does-not-exist :create)
+               (loop for line = (read-line in nil nil)
+                     while line
+                     for entry = (parse-known-hosts-line line)
+                     do (if (and entry
+                                 (hostname-matches-entry-p
+                                  (known-hosts-entry-raw-hostname entry) hostname)
+                                 (string= (known-hosts-entry-key-type entry)
+                                          key-type))
+                            (write-line (known-hosts-entry->line
+                                         (make-known-hosts-entry
+                                          :raw-hostname (known-hosts-entry-raw-hostname entry)
+                                          :key-type (known-hosts-entry-key-type entry)
+                                          :key-blob key-blob
+                                          :comment (known-hosts-entry-comment entry)))
+                                        out)
+                            (write-line line out)))))
+           (uiop:rename-file-overwriting-target staging path)
+           (setf staging nil))
+      (when staging
+        (ignore-errors
+         (delete-file staging))))))
+
 ;;;; Main entry point
 
 (defun check-host-key (hostname key-type host-key-blob
                        &key (known-hosts-path (default-known-hosts-path))
-                            (strict t))
+                         (strict t))
   "Verify HOST-KEY-BLOB against the known_hosts file.
 
    HOSTNAME         — the server hostname string
@@ -222,14 +263,15 @@
                              (known-hosts-entry-key-blob (first matches)))))
            (if strict
                (error 'host-key-changed-error
-                      :hostname             hostname
+                      :hostname hostname
                       :expected-fingerprint expected-fp
                       :received-fingerprint received-fp)
                (progn
                  (format *error-output*
                          "~&Warning: host key for '~A' has changed.~%~
-                          Expected: ~A~%~
-                          Received: ~A~%~
-                          Proceeding (strict checking is disabled).~%"
+                           Expected: ~A~%~
+                           Received: ~A~%~
+                           Proceeding (strict checking is disabled).~%"
                          hostname expected-fp received-fp)
+                 (update-known-hosts known-hosts-path hostname key-type host-key-blob)
                  :accepted-changed))))))))
