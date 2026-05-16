@@ -65,6 +65,13 @@
        (error "unsupported test key type: ~S" wire-key-type)))
     (ssh/buffer:buffer-to-octets buf)))
 
+(defun signature-blob-with-raw-sig (sig-algo raw-sig)
+  "Build a signature blob with SIG-ALGO and RAW-SIG."
+  (let ((buf (ssh/buffer:make-write-buffer)))
+    (ssh/buffer:write-string* buf sig-algo)
+    (ssh/buffer:write-string* buf raw-sig)
+    (ssh/buffer:buffer-to-octets buf)))
+
 ;;;; ---- Unencrypted keys (regression guard) --------------------------------
 
 (define-test load-ed25519-nopass
@@ -225,6 +232,38 @@
          (raw-sig     (ssh/buffer:read-string* sig-buf))
          (digest-name (if (string= algo "rsa-sha2-512") :sha512 :sha256)))
     (true (ssh/keys::rsa-pkcs1-verify (public-key k) message raw-sig digest-name))))
+
+(define-test verify-host-key-signature-rsa-sha2-rejects-truncated-signature
+  :parent (:ssh/tests ssh/tests)
+  "RSA host-key verification rejects a signature shorter than the modulus."
+  (let* ((k         (load-private-key (fixture "id_rsa_nopass")))
+         (h         (map '(vector (unsigned-byte 8)) #'char-code
+                         "rsa truncated signature"))
+         (key-blob  (host-key-blob "ssh-rsa" (public-key k)))
+         (sig-blob  (sign-auth-data k h))
+         (sig-buf   (ssh/buffer:make-read-buffer sig-blob))
+         (algo      (map 'string #'code-char (ssh/buffer:read-string* sig-buf)))
+         (raw-sig   (ssh/buffer:read-string* sig-buf))
+         (short-sig (subseq raw-sig 1)))
+    (fail (verify-host-key-signature algo key-blob h
+                                     (signature-blob-with-raw-sig algo short-sig))
+          'key-error)))
+
+(define-test verify-host-key-signature-rsa-sha2-rejects-prefixed-signature
+  :parent (:ssh/tests ssh/tests)
+  "RSA host-key verification rejects a signature with an extra leading zero byte."
+  (let* ((k            (load-private-key (fixture "id_rsa_nopass")))
+         (h            (map '(vector (unsigned-byte 8)) #'char-code
+                            "rsa prefixed signature"))
+         (key-blob     (host-key-blob "ssh-rsa" (public-key k)))
+         (sig-blob     (sign-auth-data k h))
+         (sig-buf      (ssh/buffer:make-read-buffer sig-blob))
+         (algo         (map 'string #'code-char (ssh/buffer:read-string* sig-buf)))
+         (raw-sig      (ssh/buffer:read-string* sig-buf))
+         (prefixed-sig  (concatenate '(vector (unsigned-byte 8)) #(0) raw-sig)))
+    (fail (verify-host-key-signature algo key-blob h
+                                     (signature-blob-with-raw-sig algo prefixed-sig))
+          'key-error)))
 
 ;;;; ---- Host-key signature verification -------------------------------------
 

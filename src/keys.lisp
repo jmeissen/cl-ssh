@@ -98,24 +98,26 @@
   "Verify PKCS1v1.5 signature SIG-BYTES over MESSAGE using RSA-PUB-KEY.
    DIGEST-NAME is :sha256 or :sha512.
 
-   Strategy: build the EMSA-PKCS1-v1_5 encoded message EM and delegate
-   to Ironclad's verify-signature, which performs sig^e mod n == EM."
+   Strategy: derive the modulus length from RSA-PUB-KEY, require the
+   signature to be that exact size, build the EMSA-PKCS1-v1_5 encoded
+   message EM, and delegate to Ironclad's verify-signature."
   (let* ((h       (ironclad:digest-sequence digest-name message))
          (prefix  (ecase digest-name
                     (:sha256 +sha256-der-prefix+)
                     (:sha512 +sha512-der-prefix+)))
          (t-bytes (concatenate '(vector (unsigned-byte 8)) prefix h))
-         ;; Key size in bytes — inferred from signature length which OpenSSH
-         ;; always pads to exactly ceil(|n| / 8) bytes.
-         (k       (length sig-bytes))
-         (ps-len  (- k (length t-bytes) 3)))
-    (when (< ps-len 8)
-      (error 'key-error :message "RSA key too small or malformed signature"))
-    (let* ((ps (make-array ps-len :element-type '(unsigned-byte 8)
-                                  :initial-element #xff))
-           (em (concatenate '(vector (unsigned-byte 8))
-                            #(0 1) ps #(0) t-bytes)))
-      (ironclad:verify-signature rsa-pub-key em sig-bytes))))
+         (n       (ironclad:rsa-key-modulus rsa-pub-key))
+         (k       (ceiling (integer-length n) 8)))
+    (unless (= (length sig-bytes) k)
+      (error 'key-error
+             :message "RSA signature length does not match the public key modulus"))
+    (let ((ps-len (- k (length t-bytes) 3)))
+      (when (< ps-len 8)
+        (error 'key-error :message "RSA key too small or malformed signature"))
+      (let* ((ps (make-array ps-len :element-type '(unsigned-byte 8)
+                                   :initial-element #xff))
+             (em (concatenate '(vector (unsigned-byte 8)) #(0 1) ps #(0) t-bytes)))
+        (ironclad:verify-signature rsa-pub-key em sig-bytes)))))
 
 ;;;; Public key blob parsing
 
