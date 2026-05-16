@@ -46,7 +46,8 @@
                 #:ssh-channel-stream-channel
                 #:shell-write-line
                 #:shell-read-line
-                #:shell-read-until)
+                #:shell-read-until
+                #:shell-stream-closed)
   (:import-from #:ssh/connection
                 #:channel-stdout-buffer
                 #:channel-stderr-buffer
@@ -93,7 +94,8 @@
    #:key-needs-passphrase
    #:key-needs-passphrase-path
    #:host-key-changed-error
-   #:ssh-protocol-error))
+   #:ssh-protocol-error
+   #:shell-stream-closed))
 
 (in-package #:ssh/ssh)
 

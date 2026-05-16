@@ -88,7 +88,7 @@ When you need explicit control over the connection lifetime, use `connect` and
     (ssh:disconnect client)))
 ```
 
-### Sending and receiving commands
+### Sending commands and receiving output
 #### run-command
 Single command execution.
 ```lisp
@@ -108,15 +108,35 @@ Interactive shell.
     (format t "~A" (ssh:shell-read-until shell "__DONE__"))))
 ```
 
-`open-shell` itself still returns `(values stream channel)` for callers that
-need direct channel access.  The helper functions operate on the returned binary
-stream and hide the string/octet conversion for common interactive-shell use.
+Two helper functions are available: `ssh:shell-read-line` and `ssh:shell-read-until`.
+While `shell-read-line` drains bytes until EOL, `shell-read-until` drains bytes until
+`marker`. However, `marker` can be `NIL`, thereby reading/blocking indefinitely. Both
+can also drain bytes that are currently available on the shell stream without
+blocking: just drain what is available by passing `NIL` to `:block-p`. If the
+`marker` passed to `shell-read-until` is non-nil, then whichever is first will
+win. Additionally, errors may be suppressed with `:error-p NIL`, which may modify the
+second return value in the case of a condition.
 
-Use `:pty nil` for scripted shell interaction like the example above.  A PTY is
-for terminal-oriented programs; with `:pty t`, servers commonly add prompts,
-echo typed commands, translate line endings, and emit terminal control sequences.
-Those bytes are returned as normal shell output, so marker-based reads may still
-work but the captured text is not machine-clean.
+Here's an example of using `shell-read-until` as a non-blocking drain:
+
+``` common-lisp
+(ssh:with-connection (client "my_host")
+  (ssh:with-open-shell (shell client)
+    (ssh:shell-write-line shell "cd /tmp")
+    (ssh:shell-write-line shell "ls -l")
+    (sleep 3) ; wait for the commands to successfully execute
+    (format t "~A" (ssh:shell-read-until shell nil :block-p nil))))
+```
+
+`open-shell` itself still returns `(values stream channel)` for callers that need
+direct channel access. The helper functions operate on the returned binary stream
+and hide the string/octet conversion for common interactive-shell use.
+
+Shell commands default to `:pty nil`, which is for scripted shell interaction like
+the examples above. A pseudo-terminal is for terminal-oriented programs. With `:pty
+t`, servers commonly add prompts, echo typed commands, translate line endings, and
+emit terminal control sequences. Those bytes are returned as normal shell output, so
+marker-based reads may still work but the captured text is not machine-clean.
 
 #### open-subsystem
 

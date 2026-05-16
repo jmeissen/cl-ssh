@@ -28,6 +28,8 @@
                 #:open-channel #:channel-send-data #:channel-send-eof #:channel-close
                 #:channel-request #:channel-dispatch-until
                 #:connection-error)
+  (:import-from #:ssh/packet
+                #:ssh-protocol-error)
   (:export
    ;; Blocking exec
    #:run-command
@@ -40,7 +42,9 @@
    #:shell-read-until
    #:open-subsystem
    ;; Env variable helper
-   #:send-env))
+   #:send-env
+   ;; Shell stream condition
+   #:shell-stream-closed))
 
 (in-package #:ssh/session)
 
@@ -56,33 +60,125 @@
    Reading pulls from the channel's stdout-buffer (blocking as needed).
    Writing sends SSH_MSG_CHANNEL_DATA."))
 
+(define-condition shell-stream-closed (end-of-file)
+  ((stream :initarg :stream :reader shell-stream-closed-stream))
+  (:report (lambda (condition stream)
+             (format stream "SSH shell stream closed: ~S"
+                     (shell-stream-closed-stream condition)))))
+
+(defun %shell-stream-next-byte (stream &key (block-p t))
+  "Get the next byte from STREAM.
+
+BLOCK-P determines whether the stream reading blocks to wait for the next byte.
+
+Signals SHELL-STREAM-CLOSED upon SSH_MSG_CHANNEL_CLOSE and other transport errors.
+
+Returns two values: the byte (when available) and a status keyword - being one of
+:BYTE, :EOF, or :BLOCKED."
+  (let ((conn (ssh-channel-stream-connection stream))
+        (ch   (ssh-channel-stream-channel stream)))
+    (labels ((buffered-byte ()
+               (let* ((buf (channel-stdout-buffer ch))
+                      (pos (slot-value stream 'read-pos)))
+                 (when (< pos (length buf))
+                   (incf (slot-value stream 'read-pos))
+                   (values (aref buf pos) t))))
+             (blocking-pump ()
+               (handler-case
+                   (channel-dispatch-until conn
+                                           (lambda (pkt)
+                                             (let ((type (aref pkt 0)))
+                                               (or (and (= type
+                                                           ssh/constants:+msg-channel-data+)
+                                                        (%pkt-for-channel-p pkt ch))
+                                                   (and (= type
+                                                           ssh/constants:+msg-channel-eof+)
+                                                        (%pkt-for-channel-p pkt ch))
+                                                   (and (= type
+                                                           ssh/constants:+msg-channel-close+)
+                                                        (%pkt-for-channel-p pkt ch))))))
+                 (error ()
+                   (error 'shell-stream-closed :stream stream)))))
+      (loop
+        (multiple-value-bind (byte present-p)
+            (buffered-byte)
+          (when present-p
+            (return (values byte :byte))))
+        (cond
+          ((channel-close-p ch)
+           (error 'shell-stream-closed :stream stream))
+          ((channel-eof-p ch)
+           (return (values nil :eof)))
+          (block-p
+           (blocking-pump))
+          ((stream-listen stream)
+           nil)
+          (t
+           (return (values nil :blocked))))))))
+
+(defun %shell-read-collect (stream stop-predicate finalize-fn &key (block-p t))
+  (let ((octets (make-array 128 :element-type '(unsigned-byte 8)
+                                :adjustable t
+                                :fill-pointer 0)))
+    (labels ((finish (status)
+               (funcall finalize-fn octets status)))
+      (handler-case
+          (loop
+            (multiple-value-bind (byte status)
+                (%shell-stream-next-byte stream :block-p block-p)
+              (case status
+                (:byte
+                 (vector-push-extend byte octets)
+                 (when (funcall stop-predicate octets byte)
+                   (return (finish :found))))
+                (:eof
+                 (return (finish :eof)))
+                (:blocked
+                 (return (finish :blocked))))))
+        (shell-stream-closed (condition)
+          (if (plusp (length octets))
+              (finish :closed)
+              (error condition)))))))
+
 ;;; Input — READ-BYTE
 
 (defmethod stream-read-byte ((stream ssh-channel-stream))
+  (multiple-value-bind (byte status)
+      (%shell-stream-next-byte stream)
+    (declare (ignore status))
+    byte))
+
+(defmethod stream-listen ((stream ssh-channel-stream))
   (let ((conn (ssh-channel-stream-connection stream))
-        (ch   (ssh-channel-stream-channel    stream)))
-    ;; Block until at least one byte is available or EOF
-    (loop
-      (let* ((buf (channel-stdout-buffer ch))
-             (pos (slot-value stream 'read-pos)))
-        (when (< pos (length buf))
-          (incf (slot-value stream 'read-pos))
-          (return (aref buf pos))))
-      ;; No buffered bytes — check for EOF / close
-      (when (or (channel-eof-p ch) (channel-close-p ch))
-        (return :eof))
-      ;; Pump the connection
-      (channel-dispatch-until conn (lambda (pkt)
-                                     (let ((type (aref pkt 0)))
-                                       (or (and (= type
-                                                   ssh/constants:+msg-channel-data+)
-                                                (%pkt-for-channel-p pkt ch))
-                                           (and (= type
-                                                   ssh/constants:+msg-channel-eof+)
-                                                (%pkt-for-channel-p pkt ch))
-                                           (and (= type
-                                                   ssh/constants:+msg-channel-close+)
-                                                (%pkt-for-channel-p pkt ch)))))))))
+        (ch   (ssh-channel-stream-channel stream)))
+    (labels ((buffered-p ()
+               (< (slot-value stream 'read-pos)
+                  (length (channel-stdout-buffer ch))))
+             (socket-readable-p ()
+               (let* ((transport (ssh/connection::connection-transport conn))
+                      (socket (and transport (ssh/transport::transport-socket transport))))
+                 (and socket
+                      (handler-case
+                          (multiple-value-bind (ready-sockets remaining)
+                              (usocket:wait-for-input socket :timeout 0 :ready-only t)
+                            (declare (ignore remaining))
+                            ready-sockets)
+                        (error () nil)))))
+             (pump-available-data ()
+               (loop while (and (not (buffered-p)) (socket-readable-p))
+                     do (handler-case
+                            (channel-dispatch-until conn
+                                                    (lambda (pkt)
+                                                      (declare (ignore pkt))
+                                                      t))
+                          (error (condition)
+                            (declare (ignore condition))
+                            (error 'shell-stream-closed :stream stream))))))
+      (or (buffered-p)
+          (and (not (or (channel-eof-p ch) (channel-close-p ch)))
+               (progn
+                 (pump-available-data)
+                 (buffered-p)))))))
 
 (defun %pkt-for-channel-p (pkt ch)
   "Return T if PKT is addressed to CH's local channel id."
@@ -156,78 +252,107 @@
 (defun shell-write-line (stream line)
   "Write LINE plus a newline to shell STREAM, then force output.
 
-   STREAM is the bidirectional binary stream returned by OPEN-SHELL.  LINE is
-   encoded as single-byte character codes, matching the rest of cl-ssh's
-   channel stream API."
+STREAM is the bidirectional binary stream returned by OPEN-SHELL.
+
+LINE is encoded as single-byte character codes, matching the rest of
+cl-ssh's channel stream API."
   (write-sequence (%string-to-octets line) stream)
   (write-byte 10 stream)
   (force-output stream)
   line)
 
-(defun shell-read-line (stream &optional (eof-error-p t) eof-value)
+(defun shell-read-line (stream &key (error-p t) (block-p t))
   "Read one newline-terminated line from shell STREAM.
 
-   Returns two values, like CL:READ-LINE: the line string with CR/LF removed,
-   and true when EOF ended a partial line."
-  (let ((octets (make-array 64 :element-type '(unsigned-byte 8)
-                               :adjustable t
-                               :fill-pointer 0)))
-    (loop for byte = (read-byte stream nil nil)
-          do (cond
-               ((null byte)
-                (cond
-                  ((plusp (length octets))
-                   (return (values (%octets-to-string octets) t)))
-                  (eof-error-p
-                   (error 'end-of-file :stream stream))
-                  (t
-                   (return (values eof-value t)))))
-               ((= byte 10)
-                (let ((end (length octets)))
-                  (when (and (plusp end) (= (aref octets (1- end)) 13))
-                    (decf end))
-                  (return (values (%octets-to-string octets :end end) nil))))
-               (t
-                (vector-push-extend byte octets))))))
+ERROR-P suppresses clean EOF and CLOSE errors. Otherwise, the function
+may signal one of SHELL-STREAM-CLOSED or END-OF-FILE.
 
-(defun shell-read-until (stream marker &key include-marker (eof-error-p t))
-  "Read from shell STREAM until MARKER is seen.
+Returns a string and a keyword. The keyword is one of :FOUND, :BLOCKED,
+:EOF, or :CLOSED."
+  (%shell-read-collect
+   stream
+   (lambda (octets byte)
+     (declare (ignore octets))
+     (= byte 10))
+   (lambda (octets status)
+     (let* ((end (length octets))
+            (string (progn
+                      (when (and (plusp end) (= (aref octets (1- end)) 13))
+                        (decf end))
+                      (%octets-to-string octets :end end))))
+       (case status
+         ((:found :blocked)
+          (values string status))
+         ((:eof :closed)
+          (if error-p
+              (error (case status
+                       (:eof 'end-of-file)
+                       (:closed 'shell-stream-closed))
+                     :stream stream)
+              (values string status)))
+         (otherwise
+          (error "Unknown shell read status ~S" status)))))
+   :block-p block-p))
 
-   Returns two values: the accumulated string and true if MARKER was found.
-   By default the returned string excludes MARKER; pass :INCLUDE-MARKER T to
-   keep it.  If EOF occurs first, signal END-OF-FILE unless EOF-ERROR-P is NIL,
-   in which case the accumulated string and NIL are returned."
-  (let* ((marker-octets (%string-to-octets marker))
-         (marker-length (length marker-octets))
-         (octets (make-array 128 :element-type '(unsigned-byte 8)
-                                  :adjustable t
-                                  :fill-pointer 0)))
-    (when (zerop marker-length)
+(defun shell-read-until (stream marker &key include-marker (error-p t) (block-p t))
+  "Read from shell STREAM until MARKER is seen
+
+MARKER can be a string or nil. If it is a string, then it is a substring
+that determines the read limit when BLOCK-P is t. If MARKER is nil and
+BLOCK-P is t, then it will never stop reading until a user interrupts,
+or a condition is signaled. When BLOCK-P is nil, then whichever is first
+determines when the function returns.
+
+INCLUDE-MARKER keeps the MARKER in the returned string if MARKER is a
+string, otherwise its otiose.
+
+ERROR-P suppresses clean EOF and CLOSE errors. Otherwise, the function
+may signal one of SHELL-STREAM-CLOSED or END-OF-FILE.
+
+BLOCK-P determines whether the function should block until MARKER is
+found.
+
+Returns two values: a string and a keyword. The string is the
+accumulated string until the end was reached, and the keyword is the
+read status, which is one of :FOUND or :BLOCKED. When ERROR-P is nil,
+then it may also be one of :EOF or :CLOSED."
+  (let* ((marker-octets (and marker (%string-to-octets marker)))
+         (marker-length (length marker-octets)))
+    (when (and marker (zerop marker-length))
       (error "MARKER must not be empty"))
-    (labels ((marker-present-p ()
-               (let ((start (- (length octets) marker-length)))
-                 (and (>= start 0)
-                      (loop for i below marker-length
-                            always (= (aref octets (+ start i))
-                                      (aref marker-octets i)))))))
-      (loop for byte = (read-byte stream nil nil)
-            do (cond
-                 ((null byte)
-                  (if eof-error-p
-                      (error 'end-of-file :stream stream)
-                      (return (values (%octets-to-string octets) nil))))
-                 (t
-                  (vector-push-extend byte octets)
-                  (when (marker-present-p)
-                    (let ((end (if include-marker
-                                   (length octets)
-                                   (- (length octets) marker-length))))
-                      (return (values (%octets-to-string octets :end end) t))))))))))
+    (%shell-read-collect
+     stream
+     (lambda (octets byte)
+       (declare (ignore byte))
+       (and marker
+            (let ((start (- (length octets) marker-length)))
+              (and (>= start 0)
+                   (loop for i below marker-length
+                         always (= (aref octets (+ start i))
+                                   (aref marker-octets i)))))))
+     (lambda (octets status)
+       (let* ((end (length octets))
+              (string (if (and (and (eq status :found) marker (not include-marker)))
+                          (%octets-to-string octets :end (- end marker-length))
+                          (%octets-to-string octets :end end))))
+         (case status
+           ((:found :blocked)
+            (values string status))
+           ((:eof :closed)
+            (if error-p
+                (error (case status
+                         (:eof 'end-of-file)
+                         (:closed 'shell-stream-closed))
+                       :stream stream)
+                (values string status)))
+           (otherwise
+            (error "Unknown shell read status ~S" status)))))
+     :block-p block-p)))
 
 ;;;; PTY request helper
 
 (defun request-pty (conn ch &key (term "xterm") (cols 80) (rows 24)
-                                 (width-px 0) (height-px 0))
+                              (width-px 0) (height-px 0))
   "Send a pty-req channel request."
   (let ((extra (make-write-buffer)))
     (write-string* extra term)
