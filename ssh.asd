@@ -1,6 +1,6 @@
 (defsystem "ssh"
   :class :package-inferred-system
-  :version "0.1.0"
+  :version "0.2.0"
   :author "Jeffrey Meissen <jeffrey@meissen.email>"
   :description "SSH v2 client implementation"
   :license "MIT"
