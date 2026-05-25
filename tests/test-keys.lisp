@@ -224,14 +224,40 @@
   :parent (:ssh/tests ssh/tests)
   "RSA sign/verify round-trip for a passphrase-protected key (aes256-ctr)."
   (let* ((k           (load-private-key (fixture "id_rsa_aes256ctr")
-                                        :passphrase +passphrase+))
+                                         :passphrase +passphrase+))
          (message     (map '(vector (unsigned-byte 8)) #'char-code "rsa passphrase test"))
          (sig-blob    (sign-auth-data k message))
          (sig-buf     (ssh/buffer:make-read-buffer sig-blob))
          (algo        (map 'string #'code-char (ssh/buffer:read-string* sig-buf)))
-         (raw-sig     (ssh/buffer:read-string* sig-buf))
-         (digest-name (if (string= algo "rsa-sha2-512") :sha512 :sha256)))
-    (true (ssh/keys::rsa-pkcs1-verify (public-key k) message raw-sig digest-name))))
+              (raw-sig     (ssh/buffer:read-string* sig-buf))
+              (digest-name (if (string= algo "rsa-sha2-512") :sha512 :sha256)))
+     (true (ssh/keys::rsa-pkcs1-verify (public-key k) message raw-sig digest-name))))
+
+(define-test rsa-publickey-auth-selects-strongest-advertised-algorithm
+  :parent (:ssh/tests ssh/tests)
+  (let* ((k (load-private-key (fixture "id_rsa_nopass")))
+         (transport (ssh/transport::make-transport
+                     :server-sig-algs '("ssh-rsa" "rsa-sha2-512"))))
+    (is string= "rsa-sha2-512"
+        (ssh/auth::select-publickey-signature-algorithm transport k))))
+
+(define-test rsa-publickey-auth-falls-back-without-ext-info
+  :parent (:ssh/tests ssh/tests)
+  (let* ((k (load-private-key (fixture "id_rsa_nopass")))
+         (transport (ssh/transport::make-transport)))
+    (is string= "ssh-rsa"
+        (ssh/auth::select-publickey-signature-algorithm transport k))))
+
+(define-test rsa-publickey-auth-can-sign-with-ssh-rsa
+  :parent (:ssh/tests ssh/tests)
+  (let* ((k         (load-private-key (fixture "id_rsa_nopass")))
+         (message   (map '(vector (unsigned-byte 8)) #'char-code "rsa auth sha1 test"))
+         (sig-blob  (sign-auth-data k message :algorithm "ssh-rsa"))
+         (sig-buf   (ssh/buffer:make-read-buffer sig-blob))
+         (algo      (map 'string #'code-char (ssh/buffer:read-string* sig-buf)))
+         (raw-sig   (ssh/buffer:read-string* sig-buf)))
+    (is string= "ssh-rsa" algo)
+    (true (ssh/keys::rsa-pkcs1-verify (public-key k) message raw-sig :sha1))))
 
 (define-test verify-host-key-signature-rsa-sha2-rejects-truncated-signature
   :parent (:ssh/tests ssh/tests)

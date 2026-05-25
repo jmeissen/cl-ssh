@@ -13,6 +13,7 @@
    #:+msg-service-accept+
    #:+msg-kexinit+
    #:+msg-newkeys+
+   #:+msg-ext-info+
    ;; KEX ECDH — curve25519-sha256 and generic ECDH (RFC 5656)
    #:+msg-kex-ecdh-init+
    #:+msg-kex-ecdh-reply+
@@ -71,6 +72,8 @@
    #:+mac-hmac-sha2-256+
    #:+mac-hmac-sha2-512+
    #:+compression-none+
+   #:+ext-info-c+
+   #:+ext-info-s+
    ;; Service names
    #:+service-userauth+
    #:+service-connection+
@@ -103,6 +106,7 @@
 (defconstant +msg-service-accept+  6)
 (defconstant +msg-kexinit+        20)
 (defconstant +msg-newkeys+        21)
+(defconstant +msg-ext-info+        7)
 
 ;;; KEX ECDH messages (RFC 5656 §7.1; used for curve25519-sha256 too)
 (defconstant +msg-kex-ecdh-init+  30)
@@ -171,6 +175,8 @@
 (defparameter +mac-hmac-sha2-256+           "hmac-sha2-256")
 (defparameter +mac-hmac-sha2-512+           "hmac-sha2-512")
 (defparameter +compression-none+            "none")
+(defparameter +ext-info-c+                  "ext-info-c")
+(defparameter +ext-info-s+                  "ext-info-s")
 
 ;;; Service names
 (defparameter +service-userauth+   "ssh-userauth")

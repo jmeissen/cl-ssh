@@ -22,7 +22,10 @@
                 #:+service-connection+
                 #:+auth-none+
                 #:+auth-password+
-                #:+auth-publickey+)
+                #:+auth-publickey+
+                #:+host-key-ed25519+
+                #:+host-key-rsa-sha2-256+
+                #:+host-key-rsa-sha2-512+)
   (:import-from #:ssh/buffer
                 #:make-write-buffer
                 #:write-byte*
@@ -87,6 +90,47 @@
          (partial (read-boolean buf)))
     (values methods partial)))
 
+(defun rsa-key-type-p (key-type)
+  (or (string= key-type "ssh-rsa")
+      (string= key-type +host-key-rsa-sha2-256+)
+      (string= key-type +host-key-rsa-sha2-512+)))
+
+(defun public-key-format-name (key-type)
+  (if (rsa-key-type-p key-type)
+      "ssh-rsa"
+      key-type))
+
+(defun select-publickey-signature-algorithm (transport key-info)
+  "Select the best client-auth signature algorithm for KEY-INFO.
+
+   RSA keys use server-sig-algs when available and otherwise fall back to the
+   legacy ssh-rsa signature.
+
+   Returns the algorithm name string to place in SSH_MSG_USERAUTH_REQUEST."
+  (let ((key-type (getf key-info :type)))
+    (cond
+      ((string= key-type +host-key-ed25519+)
+       key-type)
+      ((rsa-key-type-p key-type)
+       (let ((server-sig-algs (ssh/transport::transport-server-sig-algs transport)))
+         (cond
+           ((null server-sig-algs)
+             "ssh-rsa")
+           ((member +host-key-rsa-sha2-512+ server-sig-algs :test #'string=)
+            +host-key-rsa-sha2-512+)
+           ((member +host-key-rsa-sha2-256+ server-sig-algs :test #'string=)
+            +host-key-rsa-sha2-256+)
+           ((member "ssh-rsa" server-sig-algs :test #'string=)
+            "ssh-rsa")
+           (t
+            (error 'auth-error
+                   :message (format nil
+                                    "server-sig-algs does not permit RSA authentication; server allows: ~{~A~^, ~}"
+                                    server-sig-algs))))))
+      (t
+       (error 'auth-error
+               :message (format nil "unsupported public key type: ~S" key-type))))))
+
 ;;;; Auth method implementations
 
 (defun try-none (transport username)
@@ -136,20 +180,21 @@
   "Send a publickey probe (no signature) to check whether the server will
    accept this key.  Returns T if the key is acceptable."
   (let* ((key-type   (getf key-info :type))
+         (algorithm  (select-publickey-signature-algorithm transport key-info))
          (public-key (getf key-info :public-key))
          ;; Build the public key blob
          (pk-buf     (make-write-buffer)))
     ;; Encode the public key in SSH wire format
-    (write-string* pk-buf key-type)
+    (write-string* pk-buf (public-key-format-name key-type))
     (encode-public-key-into pk-buf key-type public-key)
     (let* ((pk-blob (buffer-to-octets pk-buf))
-           (req-buf (make-write-buffer)))
+            (req-buf (make-write-buffer)))
       (write-byte*   req-buf +msg-userauth-request+)
       (write-string* req-buf username)
       (write-string* req-buf +service-connection+)
       (write-string* req-buf +auth-publickey+)
       (write-boolean req-buf nil)         ; FALSE — probe, no signature
-      (write-string* req-buf key-type)
+      (write-string* req-buf algorithm)
       (write-string* req-buf pk-blob)
       (transport-send transport (buffer-to-octets req-buf)))
     (let ((reply (recv-auth-response transport)))
@@ -180,35 +225,33 @@
 (defun try-publickey (transport username key-info)
   "Attempt public-key authentication (RFC 4252 §7)."
   (let* ((key-type   (getf key-info :type))
+         (algorithm  (select-publickey-signature-algorithm transport key-info))
          (public-key (getf key-info :public-key))
          (session-id (transport-session-id transport))
-         ;; Build the public key blob
          (pk-buf     (make-write-buffer)))
-    (write-string* pk-buf key-type)
+    (write-string* pk-buf (public-key-format-name key-type))
     (encode-public-key-into pk-buf key-type public-key)
-    (let* ((pk-blob   (buffer-to-octets pk-buf))
-           ;; Build the data to sign (RFC 4252 §7):
-           ;; string(session-id) byte(50) string(username) string(service)
-           ;; string("publickey") bool(true) string(algo) string(pk-blob)
-           (sign-buf  (make-write-buffer)))
+    (let* ((pk-blob (buffer-to-octets pk-buf))
+           (sign-buf (make-write-buffer)))
+      ;; string(session-id) byte(50) string(username) string(service)
+      ;; string("publickey") bool(true) string(algo) string(pk-blob)
       (write-string* sign-buf session-id)
-      (write-byte*   sign-buf +msg-userauth-request+)
+      (write-byte* sign-buf +msg-userauth-request+)
       (write-string* sign-buf username)
       (write-string* sign-buf +service-connection+)
       (write-string* sign-buf +auth-publickey+)
       (write-boolean sign-buf t)
-      (write-string* sign-buf key-type)
+      (write-string* sign-buf algorithm)
       (write-string* sign-buf pk-blob)
       (let* ((auth-data (buffer-to-octets sign-buf))
-             (sig-blob  (sign-auth-data key-info auth-data))
-             ;; Full request with signature
+             (sig-blob  (sign-auth-data key-info auth-data :algorithm algorithm))
              (req-buf   (make-write-buffer)))
         (write-byte*   req-buf +msg-userauth-request+)
         (write-string* req-buf username)
         (write-string* req-buf +service-connection+)
         (write-string* req-buf +auth-publickey+)
-        (write-boolean req-buf t)           ; TRUE — with signature
-        (write-string* req-buf key-type)
+        (write-boolean req-buf t)
+        (write-string* req-buf algorithm)
         (write-string* req-buf pk-blob)
         (write-string* req-buf sig-blob)
         (transport-send transport (buffer-to-octets req-buf))))
@@ -219,7 +262,8 @@
          (multiple-value-bind (methods partial) (parse-failure reply)
            (declare (ignore partial))
            (error 'auth-error
-                  :message (format nil "publickey authentication failed; server allows: ~{~A~^, ~}"
+                  :message (format nil
+                                   "publickey authentication failed; server allows: ~{~A~^, ~}"
                                    methods))))
         (t (error 'auth-error
                   :message (format nil "unexpected message ~D during publickey auth"

@@ -17,7 +17,8 @@
                 #:+cipher-aes256-ctr+
                 #:+mac-hmac-sha2-256+
                 #:+mac-hmac-sha2-512+
-                #:+compression-none+)
+                #:+compression-none+
+                #:+ext-info-c+)
   (:import-from #:ssh/buffer
                 #:make-write-buffer #:write-byte* #:write-uint32 #:write-raw-bytes
                 #:write-boolean #:write-name-list #:buffer-to-octets
@@ -71,17 +72,26 @@
   (list +compression-none+)
   "Preferred compression algorithms (none only for now).")
 
+(defparameter +kex-extension-markers+
+  (list +ext-info-c+)
+  "KEXINIT marker names that advertise extension support without being real KEX algorithms.")
+
 ;;;; SSH_MSG_KEXINIT encoding (RFC 4253 §7.1)
 
-(defun kexinit-payload ()
+(defun kexinit-payload (&key (include-ext-info-c-p t))
   "Build and return the full SSH_MSG_KEXINIT payload as an octet vector.
-   The 16-byte random cookie is generated freshly each call."
+   The 16-byte random cookie is generated freshly each call.
+
+   INCLUDE-EXT-INFO-C-P controls whether the RFC 8308 client marker is
+   advertised in this first key exchange."
   (let ((buf (make-write-buffer)))
     (write-byte* buf +msg-kexinit+)
     ;; 16 random cookie bytes
     (write-raw-bytes buf (ironclad:random-data 16))
     ;; Algorithm name-lists
-    (write-name-list buf +preferred-kex+)
+    (write-name-list buf (append +preferred-kex+
+                                 (when include-ext-info-c-p
+                                   +kex-extension-markers+)))
     (write-name-list buf +preferred-host-key+)
     (write-name-list buf +preferred-cipher+)   ; encryption client→server
     (write-name-list buf +preferred-cipher+)   ; encryption server→client

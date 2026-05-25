@@ -78,6 +78,13 @@
 
 ;;;; DER prefixes for PKCS1v1.5 (EMSA-PKCS1-v1_5, RFC 8017 §9.2 Note 1)
 
+(defparameter +sha1-der-prefix+
+  (coerce '(#x30 #x21 #x30 #x09 #x06 #x05
+            #x2b #x0e #x03 #x02 #x1a
+            #x05 #x00 #x04 #x14)
+          '(vector (unsigned-byte 8)))
+  "DER AlgorithmIdentifier prefix for SHA-1 (15 bytes).")
+
 (defparameter +sha256-der-prefix+
   (coerce '(#x30 #x31 #x30 #x0d #x06 #x09
             #x60 #x86 #x48 #x01 #x65 #x03 #x04 #x02 #x01
@@ -102,9 +109,10 @@
    signature to be that exact size, build the EMSA-PKCS1-v1_5 encoded
    message EM, and delegate to Ironclad's verify-signature."
   (let* ((h       (ironclad:digest-sequence digest-name message))
-         (prefix  (ecase digest-name
-                    (:sha256 +sha256-der-prefix+)
-                    (:sha512 +sha512-der-prefix+)))
+          (prefix  (ecase digest-name
+                     (:sha1 +sha1-der-prefix+)
+                     (:sha256 +sha256-der-prefix+)
+                     (:sha512 +sha512-der-prefix+)))
          (t-bytes (concatenate '(vector (unsigned-byte 8)) prefix h))
          (n       (ironclad:rsa-key-modulus rsa-pub-key))
          (k       (ceiling (integer-length n) 8)))
@@ -486,10 +494,10 @@
 
 ;;;; Signing for publickey authentication
 
-(defun sign-auth-data (key-info auth-data)
+(defun sign-auth-data (key-info auth-data &key algorithm)
   "Sign AUTH-DATA using the private key in KEY-INFO (as returned by LOAD-PRIVATE-KEY).
    Returns a signature blob: string(algorithm) string(raw-signature)."
-  (let* ((key-type    (getf key-info :type))
+  (let* ((key-type    (or algorithm (getf key-info :type)))
          (private-key (getf key-info :private-key))
          (sig-buf     (make-write-buffer)))
     (cond
@@ -498,15 +506,20 @@
          (write-string* sig-buf +host-key-ed25519+)
          (write-string* sig-buf sig)))
 
-      ((or (string= key-type +host-key-rsa-sha2-256+)
+      ((or (string= key-type "ssh-rsa")
+           (string= key-type +host-key-rsa-sha2-256+)
            (string= key-type +host-key-rsa-sha2-512+))
-       ;; Build PKCS1v1.5 EM and sign it
-       (let* ((digest-name (if (string= key-type +host-key-rsa-sha2-256+) :sha256 :sha512))
-              (prefix      (if (eq digest-name :sha256)
-                               +sha256-der-prefix+ +sha512-der-prefix+))
-              (h           (ironclad:digest-sequence digest-name auth-data))
-              (t-bytes     (concatenate '(vector (unsigned-byte 8)) prefix h))
-              (n           (ironclad:rsa-key-modulus private-key))
+        ;; Build PKCS1v1.5 EM and sign it
+        (let* ((digest-name (cond ((string= key-type "ssh-rsa") :sha1)
+                                  ((string= key-type +host-key-rsa-sha2-256+) :sha256)
+                                  (t :sha512)))
+               (prefix      (ecase digest-name
+                              (:sha1 +sha1-der-prefix+)
+                              (:sha256 +sha256-der-prefix+)
+                              (:sha512 +sha512-der-prefix+)))
+               (h           (ironclad:digest-sequence digest-name auth-data))
+               (t-bytes     (concatenate '(vector (unsigned-byte 8)) prefix h))
+               (n           (ironclad:rsa-key-modulus private-key))
               (k           (ceiling (integer-length n) 8))
               (ps-len      (- k (length t-bytes) 3))
               (ps          (make-array ps-len :element-type '(unsigned-byte 8)

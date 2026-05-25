@@ -18,6 +18,7 @@
   (:import-from #:ssh/constants
                 #:+msg-kexinit+
                 #:+msg-newkeys+
+                #:+msg-ext-info+
                 #:+msg-service-request+
                 #:+msg-service-accept+
                 #:+msg-disconnect+
@@ -30,19 +31,22 @@
                 #:+mac-hmac-sha2-256+
                 #:+mac-hmac-sha2-512+
                 #:+client-version-string+
+                #:+ext-info-c+
                 #:+disconnect-protocol-error+)
   (:import-from #:ssh/buffer
                 #:make-write-buffer #:write-byte* #:write-uint32 #:write-string*
                 #:buffer-to-octets
-                #:make-read-buffer #:read-byte* #:read-uint32 #:read-string*)
+                #:make-read-buffer #:read-byte* #:read-uint32 #:read-string*
+                #:read-remaining-bytes #:read-name-list)
   (:import-from #:ssh/packet
                 #:make-packet-stream #:send-packet #:recv-packet #:install-keys
                 #:make-hmac-mac-fn #:ssh-protocol-error)
   (:import-from #:ssh/algorithms
-                #:kexinit-payload #:parse-kexinit #:negotiate-algorithms
-                #:negotiated-kex #:negotiated-host-key
-                #:negotiated-cipher-c2s #:negotiated-cipher-s2c
-                #:negotiated-mac-c2s #:negotiated-mac-s2c)
+                 #:kexinit-payload #:parse-kexinit #:kexinit-kex-algorithms
+                 #:negotiate-algorithms
+                 #:negotiated-kex #:negotiated-host-key
+                 #:negotiated-cipher-c2s #:negotiated-cipher-s2c
+                 #:negotiated-mac-c2s #:negotiated-mac-s2c)
   (:import-from #:ssh/kex
                 #:perform-kex-curve25519
                 #:perform-kex-dh-group14
@@ -79,6 +83,7 @@
 (defstruct transport
   packet-stream
   session-id
+  server-sig-algs
   hostname
   ;; The raw socket (kept for cleanup)
   socket)
@@ -201,6 +206,52 @@
         (send-packet ps (buffer-to-octets buf)))
     (error () nil)))                        ; ignore errors during teardown
 
+(defun parse-ext-info-payload (payload)
+  "Parse SSH_MSG_EXT_INFO and return an alist of extension names to raw values."
+  (handler-case
+      (let ((buf (make-read-buffer payload :start 1)))
+        (let ((count (read-uint32 buf))
+              (extensions '()))
+          (loop repeat count
+                do
+            (push (cons (map 'string #'code-char (read-string* buf))
+                        (read-string* buf))
+                  extensions))
+          (when (plusp (read-remaining-bytes buf))
+            (error 'transport-error
+                   :message "malformed SSH_MSG_EXT_INFO: trailing bytes"))
+          (nreverse extensions)))
+    (error (c)
+      (error 'transport-error
+             :message (format nil "malformed SSH_MSG_EXT_INFO: ~A" c)))))
+
+(defun csv-string-to-name-list (string)
+  (loop with start = 0
+        for end = (position #\, string :start start)
+        for item = (subseq string start end)
+        unless (string= item "")
+          collect item
+        while end
+        do (setf start (1+ end))))
+
+(defun process-ext-info (transport payload)
+  "Update TRANSPORT state from an SSH_MSG_EXT_INFO payload."
+  (let ((extensions (parse-ext-info-payload payload)))
+    (setf (transport-server-sig-algs transport)
+          (let ((entry (assoc "server-sig-algs" extensions :test #'string=)))
+            (when entry
+              (csv-string-to-name-list
+               (map 'string #'code-char (cdr entry))))))
+    nil))
+
+(defun validate-server-kexinit (server-kexinit)
+  "Reject role-incorrect extension markers in the server KEXINIT."
+  (when (member +ext-info-c+
+                (kexinit-kex-algorithms server-kexinit)
+                :test #'string=)
+    (error 'transport-error
+           :message "server sent ext-info-c in KEXINIT")))
+
 ;;;; Main setup
 
 (defun connect-transport (hostname
@@ -214,9 +265,12 @@
    KNOWN-HOSTS-PATH  — pathname for the known_hosts file; NIL uses the default.
    STRICT-HOST-CHECKING — if true (default), refuse changed host keys."
   (let* ((socket  (usocket:socket-connect hostname port
-                                          :element-type '(unsigned-byte 8)))
-         (stream  (usocket:socket-stream socket))
-         (ps      (make-packet-stream stream)))
+                                           :element-type '(unsigned-byte 8)))
+          (stream  (usocket:socket-stream socket))
+          (ps      (make-packet-stream stream))
+          (transport (make-transport :packet-stream ps
+                                     :hostname hostname
+                                     :socket socket)))
 
     (handler-bind ((error (lambda (e)
                             (declare (ignore e))
@@ -237,13 +291,14 @@
               (error 'transport-error
                      :message (format nil "expected KEXINIT (20), got ~D"
                                       (aref server-kexinit-payload 0))))
-            (let* ((server-kexinit (parse-kexinit server-kexinit-payload))
-                   ;; 4. Negotiate algorithms
+            (let* ((server-kexinit (parse-kexinit server-kexinit-payload)))
+              (validate-server-kexinit server-kexinit)
+              (let* (;; 4. Negotiate algorithms
                    (neg (negotiate-algorithms server-kexinit))
-                   (kex-algo      (negotiated-kex neg))
-                   (host-key-algo (negotiated-host-key neg))
-                   (cipher-c2s   (negotiated-cipher-c2s neg))
-                   (cipher-s2c   (negotiated-cipher-s2c neg))
+                    (kex-algo      (negotiated-kex neg))
+                    (host-key-algo (negotiated-host-key neg))
+                    (cipher-c2s   (negotiated-cipher-c2s neg))
+                    (cipher-s2c   (negotiated-cipher-s2c neg))
                    (mac-c2s-name (negotiated-mac-c2s neg))
                    (mac-s2c-name (negotiated-mac-s2c neg)))
 
@@ -320,34 +375,34 @@
 
                 ;; Expect SSH_MSG_SERVICE_ACCEPT
                 (let ((svc-reply (transport-recv-skipping-global
-                                   ps +msg-service-accept+)))
+                                   transport +msg-service-accept+)))
                   (declare (ignore svc-reply)))
 
-                (make-transport
-                 :packet-stream ps
-                 :session-id    (kex-result-session-id kex-result)
-                 :hostname      hostname
-                 :socket        socket))))))))))
+                (setf (transport-session-id transport)
+                      (kex-result-session-id kex-result))
+                transport))))))))))
 
 ;;;; Message dispatch helpers
 
-(defun transport-recv-skipping-global (ps expected-type)
+(defun transport-recv-skipping-global (transport expected-type)
   "Receive packets, silently handling IGNORE/DEBUG/UNIMPLEMENTED, until a
    packet of EXPECTED-TYPE (or any non-global message) is found.
    Returns the payload."
-  (loop
-    (let ((pkt (recv-packet ps)))
-      (case (aref pkt 0)
-        (#.+msg-ignore+        nil)   ; discard
-        (#.+msg-debug+         nil)   ; discard (could log)
-        (#.+msg-disconnect+
-         (error 'transport-error :message "server sent SSH_MSG_DISCONNECT"))
-        (otherwise
-         (when (and expected-type (/= (aref pkt 0) expected-type))
-           (error 'transport-error
-                  :message (format nil "expected message type ~D, got ~D"
-                                   expected-type (aref pkt 0))))
-         (return pkt))))))
+  (let ((ps (transport-packet-stream transport)))
+    (loop
+      for pkt = (recv-packet ps)
+      do (case (aref pkt 0)
+           (#.+msg-ignore+ nil)   ; discard
+           (#.+msg-debug+ nil)    ; discard (could log)
+           (#.+msg-ext-info+ (process-ext-info transport pkt))
+           (#.+msg-disconnect+
+            (error 'transport-error :message "server sent SSH_MSG_DISCONNECT"))
+           (otherwise
+            (when (and expected-type (/= (aref pkt 0) expected-type))
+              (error 'transport-error
+                     :message (format nil "expected message type ~D, got ~D"
+                                      expected-type (aref pkt 0))))
+            (return-from transport-recv-skipping-global pkt))))))
 
 ;;;; Public send / recv
 
@@ -357,7 +412,7 @@
 
 (defun transport-recv (transport)
   "Receive the next application-layer packet, skipping IGNORE/DEBUG."
-  (transport-recv-skipping-global (transport-packet-stream transport) nil))
+  (transport-recv-skipping-global transport nil))
 
 (defun transport-disconnect (transport &optional (reason "normal closure"))
   "Send SSH_MSG_DISCONNECT and close the TCP connection."
