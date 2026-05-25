@@ -221,7 +221,7 @@ the RFC to claim full compliance.
 | RFC 5656            | None, but should be implemented                   | NIST ECDH, ECDSA, and ECMQV are not implemented; Curve25519 only reuses ECDH packet framing.                            |
 | RFC 6668            | Yes                                               | `hmac-sha2-256` and `hmac-sha2-512` are advertised and wired into packet MAC handling.                                  |
 | RFC 8268            | Partial                                           | `diffie-hellman-group14-sha256` is implemented; group15-18 are absent.                                                  |
-| RFC 8308            | Partial                                           | `ext-info-c/s`, `SSH_MSG_EXT_INFO`, and `server-sig-algs` are implemented for client auth discovery.                    |
+| RFC 8308            | Partial                                           | Not done (yet), §3.2-4: `delay-compression`, `no-flow-control`, `elevation`.                                            |
 | RFC 8332            | Partial                                           | RSA-SHA2 host-key verification exists; RSA publickey auth follows `server-sig-algs` selection.                          |
 | RFC 8709            | Partial                                           | `ssh-ed25519` is supported; `ssh-ed448` and SSHFP Ed448 handling are absent.                                            |
 | RFC 8731            | Partial                                           | `curve25519-sha256` and `curve25519-sha256@libssh.org` are implemented; `curve448-sha512` is absent.                    |

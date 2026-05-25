@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Support for RFC 8308 `ext-info` discovery and `server-sig-algs`-based RSA public
+  key authentication selection (RFC 8308 §3.1)
+- Integration tests through Docker and an additional integration testing system.
+
 ## [0.2.0] - 2026-05-17
 
 ### Added
