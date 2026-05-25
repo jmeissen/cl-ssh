@@ -89,6 +89,44 @@
 
 ;;; ---- RFC 8308 ------------------------------------------------------------
 
+(define-test negotiate-algorithms-accepts-curve25519-sha256-libssh-alias
+  :parent (:ssh/tests ssh/tests)
+  (let* ((payload (ssh/algorithms:kexinit-payload))
+         (server-kexinit (ssh/algorithms:parse-kexinit payload)))
+    (setf (ssh/algorithms::kexinit-kex-algorithms server-kexinit)
+          (list ssh/constants::+kex-curve25519-sha256-libssh+))
+    (is string= ssh/constants::+kex-curve25519-sha256-libssh+
+        (ssh/algorithms::negotiated-kex
+         (ssh/algorithms::negotiate-algorithms server-kexinit)))))
+
+(define-test negotiate-algorithms-selects-aes256-ctr
+  :parent (:ssh/tests ssh/tests)
+  (let* ((payload (ssh/algorithms:kexinit-payload))
+         (server-kexinit (ssh/algorithms:parse-kexinit payload)))
+    (setf (ssh/algorithms::kexinit-encryption-algorithms-c2s server-kexinit)
+          (list ssh/constants::+cipher-aes256-ctr+)
+          (ssh/algorithms::kexinit-encryption-algorithms-s2c server-kexinit)
+          (list ssh/constants::+cipher-aes256-ctr+))
+    (let ((negotiated (ssh/algorithms::negotiate-algorithms server-kexinit)))
+      (is string= ssh/constants::+cipher-aes256-ctr+
+          (ssh/algorithms::negotiated-cipher-c2s negotiated))
+      (is string= ssh/constants::+cipher-aes256-ctr+
+          (ssh/algorithms::negotiated-cipher-s2c negotiated)))))
+
+(define-test negotiate-algorithms-selects-hmac-sha2-512
+  :parent (:ssh/tests ssh/tests)
+  (let* ((payload (ssh/algorithms:kexinit-payload))
+         (server-kexinit (ssh/algorithms:parse-kexinit payload)))
+    (setf (ssh/algorithms::kexinit-mac-algorithms-c2s server-kexinit)
+            (list ssh/constants:+mac-hmac-sha2-512+)
+          (ssh/algorithms::kexinit-mac-algorithms-s2c server-kexinit)
+            (list ssh/constants:+mac-hmac-sha2-512+))
+    (let ((negotiated (ssh/algorithms:negotiate-algorithms server-kexinit)))
+      (is string= ssh/constants:+mac-hmac-sha2-512+
+          (ssh/algorithms::negotiated-mac-c2s negotiated))
+      (is string= ssh/constants:+mac-hmac-sha2-512+
+          (ssh/algorithms::negotiated-mac-s2c negotiated)))))
+
 (define-test kexinit-advertises-ext-info-c
   :parent (:ssh/tests ssh/tests)
   (let* ((payload (ssh/algorithms:kexinit-payload))

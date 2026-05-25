@@ -149,19 +149,26 @@ marker-based reads may still work but the captured text is not machine-clean.
 
 ## Supported algorithms
 
-| Category    | Algorithm                       | Tested |
-|-------------|---------------------------------|--------|
-| KEX         | `curve25519-sha256`             | Yes    |
-| KEX         | `curve25519-sha256@libssh.org`  | No     |
-| KEX         | `diffie-hellman-group14-sha256` | Yes    |
-| Host keys   | `ssh-ed25519`                   | Yes    |
-| Host keys   | `rsa-sha2-256`                  | Manual |
-| Host keys   | `rsa-sha2-512`                  | -      |
-| Ciphers     | `aes128-ctr`                    | Yes    |
-| Ciphers     | `aes256-ctr`                    | No     |
-| MACs        | `hmac-sha2-256`                 | Yes    |
-| MACs        | `hmac-sha2-512`                 | No     |
-| Compression | `none`                          | —      |
+The `Tested` column is shorthand: `Yes` means at least unit-test coverage exists and
+`-` means no dedicated test yet. Some have integration tests.
+
+| Category       | Algorithm                       | Tested |
+|----------------|---------------------------------|--------|
+| KEX            | `curve25519-sha256`             | Yes    |
+| KEX            | `curve25519-sha256@libssh.org`  | Yes    |
+| KEX            | `diffie-hellman-group14-sha256` | Yes    |
+| Host keys      | `ssh-ed25519`                   | Yes    |
+| Host keys      | `rsa-sha2-256`                  | Yes    |
+| Host keys      | `rsa-sha2-512`                  | Yes    |
+| Publickey auth | `ssh-ed25519`                   | Yes    |
+| Publickey auth | `rsa-sha2-512`                  | Yes    |
+| Publickey auth | `rsa-sha2-256`                  | Yes    |
+| Publickey auth | `ssh-rsa`                       | Yes    |
+| Ciphers        | `aes128-ctr`                    | Yes    |
+| Ciphers        | `aes256-ctr`                    | Yes    |
+| MACs           | `hmac-sha2-256`                 | Yes    |
+| MACs           | `hmac-sha2-512`                 | Yes    |
+| Compression    | `none`                          | —      |
 
 
 ## Supported authentication methods
@@ -199,28 +206,28 @@ This table distinguishes code support from full RFC compliance. "Partial" means
 the code implements useful pieces of the RFC, but does not implement enough of
 the RFC to claim full compliance.
 
-| RFC                 | Compliant?                                        | Notes                                                                                                           |
-|---------------------|---------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
-| RFC 4250            | Partial                                           | Constants and algorithm names are defined for the supported subset only.                                        |
-| RFC 4251            | Partial                                           | SSH binary data types are implemented, but this is not full architecture compliance.                            |
-| RFC 4252            | Partial                                           | Supports `none`, `password`, and `publickey`; no full authentication protocol coverage.                         |
-| RFC 4253            | Partial                                           | Transport, KEXINIT, NEWKEYS, packet framing, and key derivation exist; no rekey and limited algorithms.         |
-| RFC 4254            | Partial                                           | Basic session channel, exec, shell, subsystem, and flow-control handling exist.                                 |
-| RFC 4255            | None, probably too niche as well                  | DNS SSHFP lookup and validation are not implemented.                                                            |
-| RFC 4256            | None, but probably should add                     | Keyboard-interactive authentication is not implemented.                                                         |
-| RFC 4344            | Partial                                           | `aes128-ctr` and `aes256-ctr` are supported; rekey recommendations are not implemented.                         |
-| RFC 4419 / RFC 8270 | None, but mostly deprecated                       | Diffie-Hellman group exchange is not implemented.                                                               |
-| RFC 5647            | None. Should do the OpenSSH one when implementing | AES-GCM is not implemented.                                                                                     |
-| RFC 5656            | None, but should be implemented                   | NIST ECDH, ECDSA, and ECMQV are not implemented; Curve25519 only reuses ECDH packet framing.                    |
-| RFC 6668            | Yes                                               | `hmac-sha2-256` and `hmac-sha2-512` are advertised and wired into packet MAC handling.                          |
-| RFC 8268            | Partial                                           | `diffie-hellman-group14-sha256` is implemented; group15-18 are absent.                                          |
-| RFC 8308            | Partial                                           | `ext-info-c/s`, `SSH_MSG_EXT_INFO`, and `server-sig-algs` are implemented for client auth discovery.            |
-| RFC 8332            | Partial                                           | RSA-SHA2 host-key verification exists; RSA publickey client auth follows server-sig-algs selection.             |
-| RFC 8709            | Partial                                           | `ssh-ed25519` is supported; `ssh-ed448` and SSHFP Ed448 handling are absent.                                    |
-| RFC 8731            | Partial                                           | `curve25519-sha256` and `curve25519-sha256@libssh.org` are implemented; `curve448-sha512` is absent.            |
-| RFC 8758            | Yes                                               | RC4/arcfour algorithms are not implemented or advertised.                                                       |
-| RFC 9142            | Partial                                           | Some recommended KEX methods are present, but extension negotiation and several recommended methods are absent. |
-| RFC 9941            | None. Should be done in the future                | `sntrup761x25519-sha512` and the OpenSSH alias are not implemented.                                             |
+| RFC                 | Compliant?                                        | Notes                                                                                                                   |
+|---------------------|---------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
+| RFC 4250            | Partial                                           | Constants and algorithm names are defined for the supported subset only.                                                |
+| RFC 4251            | Partial                                           | SSH binary data types are implemented, but this is not full architecture compliance.                                    |
+| RFC 4252            | Partial                                           | Supports `none`, `password`, and `publickey`;  `keyboard-interactive` is not implemented.                               |
+| RFC 4253            | Partial                                           | Transport, KEXINIT, NEWKEYS, packet framing, and key derivation exist; no rekey and limited algorithms.                 |
+| RFC 4254            | Partial                                           | Basic session channel, exec, shell, subsystem, and flow-control handling exist; port forwarding and server mode do not. |
+| RFC 4255            | None, probably too niche as well                  | DNS SSHFP lookup and validation are not implemented.                                                                    |
+| RFC 4256            | None, but probably should add                     | Keyboard-interactive authentication is not implemented.                                                                 |
+| RFC 4344            | Partial                                           | `aes128-ctr` and `aes256-ctr` are supported; rekey recommendations are not implemented.                                 |
+| RFC 4419 / RFC 8270 | None, but mostly deprecated                       | Diffie-Hellman group exchange is not implemented.                                                                       |
+| RFC 5647            | None. Should do the OpenSSH one when implementing | AES-GCM is not implemented.                                                                                             |
+| RFC 5656            | None, but should be implemented                   | NIST ECDH, ECDSA, and ECMQV are not implemented; Curve25519 only reuses ECDH packet framing.                            |
+| RFC 6668            | Yes                                               | `hmac-sha2-256` and `hmac-sha2-512` are advertised and wired into packet MAC handling.                                  |
+| RFC 8268            | Partial                                           | `diffie-hellman-group14-sha256` is implemented; group15-18 are absent.                                                  |
+| RFC 8308            | Partial                                           | `ext-info-c/s`, `SSH_MSG_EXT_INFO`, and `server-sig-algs` are implemented for client auth discovery.                    |
+| RFC 8332            | Partial                                           | RSA-SHA2 host-key verification exists; RSA publickey auth follows `server-sig-algs` selection.                          |
+| RFC 8709            | Partial                                           | `ssh-ed25519` is supported; `ssh-ed448` and SSHFP Ed448 handling are absent.                                            |
+| RFC 8731            | Partial                                           | `curve25519-sha256` and `curve25519-sha256@libssh.org` are implemented; `curve448-sha512` is absent.                    |
+| RFC 8758            | Yes                                               | RC4/arcfour algorithms are not implemented or advertised.                                                               |
+| RFC 9142            | Partial                                           | Some recommended KEX methods are present, but extension negotiation and several recommended methods are absent.         |
+| RFC 9941            | None. Should be done in the future                | `sntrup761x25519-sha512` and the OpenSSH alias are not implemented.                                                     |
 
 Quite some SSH RFCs are omitted. Some are deprecated, some too niche to even mention,
 or they do not seem relevant at the time of writing. Please open an issue upon
@@ -237,3 +244,15 @@ qlot install
 ``` shell
 sbcl --disable-debugger --load .qlot/setup.lisp --eval '(asdf:test-system :ssh)' --quit
 ```
+
+## Integration tests
+
+Live integration tests run against a Docker Compose OpenSSH server on `127.0.0.1:2222`.
+
+``` shell
+./scripts/run-integration-tests.sh
+```
+
+Set `SSH_TEST_REBUILD=1` if you changed the Docker image or want a fresh rebuild.
+
+If you want to drive them manually, set `SSH_TEST_HOST`, `SSH_TEST_PORT`, `SSH_TEST_USER`, `SSH_TEST_PASSWORD`, and `SSH_TEST_KNOWN_HOSTS`, then run `asdf:test-system :ssh/integration-tests`.

@@ -1,0 +1,14 @@
+Port 22
+ListenAddress 0.0.0.0
+Protocol 2
+PermitRootLogin no
+PasswordAuthentication yes
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+UsePAM no
+AllowUsers ssh-test
+AuthorizedKeysFile .ssh/authorized_keys
+Subsystem sftp internal-sftp
+PidFile /run/sshd.pid
+LogLevel VERBOSE

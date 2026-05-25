@@ -28,3 +28,11 @@
                 (:file "tests/test-keys"))
   :perform (test-op (op c)
                     (uiop:symbol-call :parachute :test :ssh/tests)))
+
+(defsystem "ssh/integration-tests"
+  :depends-on ("ssh"
+               "parachute")
+  :serial t
+  :components ((:file "tests/test-integration"))
+  :perform (test-op (op c)
+                    (uiop:symbol-call :parachute :test :ssh/integration-tests)))

@@ -1,0 +1,21 @@
+services:
+  sshd:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "127.0.0.1:2222:22"
+  sshd-rsa-sha2-256:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "127.0.0.1:2223:22"
+    command: ["-o", "PubkeyAcceptedAlgorithms=rsa-sha2-256"]
+  sshd-ssh-rsa:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "127.0.0.1:2224:22"
+    command: ["-o", "PubkeyAcceptedAlgorithms=ssh-rsa"]

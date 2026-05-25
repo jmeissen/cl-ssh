@@ -315,6 +315,17 @@
             (verify-host-key-signature "rsa-sha2-256" key-blob h sig-blob)
             t))))
 
+(define-test verify-host-key-signature-rsa-sha2-512-valid
+  :parent (:ssh/tests ssh/tests)
+  "rsa-sha2-512 host-key verification uses the ssh-rsa wire format and SHA-512 signing."
+  (let* ((k (load-private-key (fixture "id_rsa_nopass")))
+         (h (map '(vector (unsigned-byte 8)) #'char-code "rsa-512 host key exchange hash"))
+         (key-blob (host-key-blob "ssh-rsa" (public-key k)))
+         (sig-blob (sign-auth-data k h :algorithm "rsa-sha2-512")))
+    (true (progn
+            (verify-host-key-signature "rsa-sha2-512" key-blob h sig-blob)
+            t))))
+
 (define-test verify-host-key-signature-rejects-algorithm-mismatch
   :parent (:ssh/tests ssh/tests)
   "The server-controlled signature algorithm must match negotiation."
