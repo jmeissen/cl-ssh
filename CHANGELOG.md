@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- Support RFC 4256 `keyboard-interactive` authentication method. Fully supported,
+  except there's no inbuilt masking of user input (RFC 4256 §3.3 ¶6).
 - Support for RFC 8308 `ext-info` discovery and `server-sig-algs`-based RSA public
   key authentication selection (RFC 8308 §3.1)
 - Integration tests through Docker and an additional integration testing system.

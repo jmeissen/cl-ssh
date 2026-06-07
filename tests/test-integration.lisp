@@ -76,6 +76,20 @@
 (defun integration-user ()
   (or (env-value "SSH_TEST_USER") "ssh-test"))
 
+(defun integration-kbdint-port ()
+  (env-port "SSH_TEST_KBDINT_PORT"))
+
+(defun integration-partial-success-port ()
+  (env-port "SSH_TEST_PARTIAL_SUCCESS_PORT"))
+
+(defun keyboard-interactive-response-callback (response)
+  (lambda (name instruction language-tag prompts)
+    (declare (ignore name instruction language-tag))
+    (mapcar (lambda (prompt)
+              (declare (ignore prompt))
+              response)
+            prompts)))
+
 (defun trim-output (string)
   (string-trim '(#\Space #\Tab #\Newline #\Return) string))
 
@@ -107,24 +121,31 @@
                          (is = 0 exit-code))))
                 (ignore-errors (ssh/transport::transport-disconnect transport))))
             (skip "requires SSH_TEST_HOST, SSH_TEST_USER, and SSH_TEST_KNOWN_HOSTS"
-              (true t))))
+                  (true t))))
       (skip "requires an RSA algorithm-specific SSH_TEST_*_PORT"
-        (true t))))
+            (true t))))
 
-(defmacro with-live-client ((client &key identity passphrase password port) &body body)
+(defmacro with-live-client ((client &key identity passphrase password port
+                                      keyboard-interactive-callback
+                                      keyboard-interactive-submethods)
+                            &body body)
   `(let ((target (integration-target ,port)))
      (if target
          (with-connection (,client (integration-target-host target)
-                                  :port (integration-target-port target)
-                                  :username (integration-target-user target)
-                                  :known-hosts-path (integration-target-known-hosts target)
-                                  :strict-host-checking t
-                                  ,@(when identity `(:identity ,identity))
-                                  ,@(when passphrase `(:passphrase ,passphrase))
-                                  ,@(when password `(:password ,password)))
+                                   :port (integration-target-port target)
+                                   :username (integration-target-user target)
+                                   :known-hosts-path (integration-target-known-hosts target)
+                                   :strict-host-checking t
+                                   ,@(when identity `(:identity ,identity))
+                                   ,@(when passphrase `(:passphrase ,passphrase))
+                                   ,@(when password `(:password ,password))
+                                   ,@(when keyboard-interactive-callback
+                                       `(:keyboard-interactive-callback ,keyboard-interactive-callback))
+                                   ,@(when keyboard-interactive-submethods
+                                       `(:keyboard-interactive-submethods ,keyboard-interactive-submethods)))
            ,@body)
          (skip "requires SSH_TEST_HOST, SSH_TEST_PORT, SSH_TEST_USER, and SSH_TEST_KNOWN_HOSTS"
-           (true t)))))
+               (true t)))))
 
 (define-test ssh/integration-tests)
 
@@ -167,6 +188,84 @@
             (is string= "" stderr)
             (is = 0 exit-code)))
         (skip "requires SSH_TEST_PASSWORD"
+          (true t)))))
+
+(define-test keyboard-interactive-auth-works
+  :parent (:ssh/integration-tests ssh/integration-tests)
+  (let* ((port (integration-kbdint-port))
+         (password (integration-password)))
+    (if (and port password)
+        (with-live-client (client
+                           :port port
+                           :keyboard-interactive-callback
+                           (keyboard-interactive-response-callback password))
+          (multiple-value-bind (stdout stderr exit-code)
+              (run-command client "whoami")
+            (is string= (integration-user) (trim-output stdout))
+            (is string= "" stderr)
+            (is = 0 exit-code)))
+        (skip "requires SSH_TEST_KBDINT_PORT and SSH_TEST_PASSWORD"
+          (true t)))))
+
+(define-test keyboard-interactive-auth-fails-with-wrong-response
+  :parent (:ssh/integration-tests ssh/integration-tests)
+  (let* ((port (integration-kbdint-port))
+         (password (integration-password))
+         (target (and port (integration-target port))))
+    (if (and target password)
+        (of-type 'ssh:auth-error
+          (handler-case
+              (let ((client (connect (integration-target-host target)
+                                     :port (integration-target-port target)
+                                     :username (integration-target-user target)
+                                     :known-hosts-path (integration-target-known-hosts target)
+                                     :strict-host-checking t
+                                     :keyboard-interactive-callback
+                                     (keyboard-interactive-response-callback
+                                      "definitely-not-the-right-password"))))
+                (unwind-protect
+                     nil
+                  (ignore-errors (disconnect client))))
+            (ssh:auth-error (c) c)))
+        (skip "requires SSH_TEST_KBDINT_PORT and SSH_TEST_PASSWORD"
+          (true t)))))
+
+(define-test publickey-then-keyboard-interactive-partial-success-works
+  :parent (:ssh/integration-tests ssh/integration-tests)
+  (let* ((port (integration-partial-success-port))
+         (password (integration-password))
+         (target (and port password (integration-target port))))
+    (if target
+        (let ((captured-condition nil)
+              (client nil))
+          (setf client
+                (handler-bind ((ssh/auth:auth-partial-success
+                                (lambda (c)
+                                  (setf captured-condition c)
+                                  (invoke-restart 'ssh/auth::continue-authentication
+                                                  "keyboard-interactive"
+                                                  (keyboard-interactive-response-callback password)))))
+                  (connect (integration-target-host target)
+                           :port (integration-target-port target)
+                           :username (integration-target-user target)
+                           :known-hosts-path (integration-target-known-hosts target)
+                           :identity (fixture-path "id_ed25519_nopass")
+                           :strict-host-checking t)))
+          (unwind-protect
+               (progn
+                 (true captured-condition)
+                 (is string= "publickey"
+                     (ssh/auth:auth-partial-success-attempted-method captured-condition))
+                 (is equal '("keyboard-interactive")
+                     (ssh/auth:auth-partial-success-allowed-methods captured-condition))
+                 (true (ssh/auth:auth-partial-success-partial-success-p captured-condition))
+                 (multiple-value-bind (stdout stderr exit-code)
+                     (run-command client "whoami")
+                   (is string= (integration-user) (trim-output stdout))
+                   (is string= "" stderr)
+                   (is = 0 exit-code)))
+            (ignore-errors (disconnect client))))
+        (skip "requires SSH_TEST_PARTIAL_SUCCESS_PORT and SSH_TEST_PASSWORD"
           (true t)))))
 
 (define-test run-command-returns-stdout-stderr-and-exit-code

@@ -5,7 +5,7 @@
 ;;;;   password         — plaintext password inside the encrypted transport
 ;;;;   publickey        — sign an auth-data blob with the user's private key
 ;;;;
-;;;; keyboard-interactive is not yet implemented.
+;;;; keyboard-interactive (RFC 4256) is supported via callback.
 ;;;;
 ;;;; Usage:
 ;;;;   (authenticate transport username :password "secret")
@@ -19,10 +19,13 @@
                 #:+msg-userauth-success+
                 #:+msg-userauth-banner+
                 #:+msg-userauth-pk-ok+
+                #:+msg-userauth-info-request+
+                #:+msg-userauth-info-response+
                 #:+service-connection+
                 #:+auth-none+
                 #:+auth-password+
                 #:+auth-publickey+
+                #:+auth-keyboard-interactive+
                 #:+host-key-ed25519+
                 #:+host-key-rsa-sha2-256+
                 #:+host-key-rsa-sha2-512+)
@@ -37,6 +40,7 @@
                 #:read-byte*
                 #:read-string*
                 #:read-boolean
+                #:read-uint32
                 #:utf-8-to-octets)
   (:import-from #:ssh/transport
                 #:transport
@@ -48,7 +52,12 @@
                 #:sign-auth-data)
   (:export
    #:authenticate
-   #:auth-error))
+   #:make-keyboard-interactive-cli-callback
+   #:auth-error
+   #:auth-partial-success
+   #:auth-partial-success-allowed-methods
+   #:auth-partial-success-attempted-method
+   #:auth-partial-success-partial-success-p))
 
 (in-package #:ssh/auth)
 
@@ -59,6 +68,18 @@
   (:report (lambda (c s)
              (format s "SSH authentication error: ~A" (auth-error-message c)))))
 
+(define-condition auth-partial-success (condition)
+  ((attempted-method :initarg :attempted-method
+                     :reader auth-partial-success-attempted-method)
+   (allowed-methods :initarg :allowed-methods
+                    :reader auth-partial-success-allowed-methods)
+   (partial-success-p :initarg :partial-success-p
+                      :reader auth-partial-success-partial-success-p))
+  (:report (lambda (c s)
+             (format s "SSH authentication partially succeeded after ~A; server allows: ~{~A~^, ~}"
+                     (auth-partial-success-attempted-method c)
+                     (auth-partial-success-allowed-methods c)))))
+
 ;;;; Internal helpers
 
 (defun recv-auth-response (transport)
@@ -68,9 +89,10 @@
     (let ((pkt (transport-recv transport)))
       (case (aref pkt 0)
         (#.+msg-userauth-banner+
-         ;; Print banner to *standard-output* and continue waiting
+         ;; Display a filtered banner and continue waiting.
          (let* ((buf  (make-read-buffer pkt :start 1))
-                (text (map 'string #'code-char (read-string* buf))))
+                (text (filter-control-characters
+                       (octets-to-utf-8-string (read-string* buf)))))
            (write-string text *standard-output*)
            (force-output *standard-output*)))
         (otherwise
@@ -89,6 +111,155 @@
                                 while end)))))
          (partial (read-boolean buf)))
     (values methods partial)))
+
+(defun normalize-submethods (submethods)
+  "Normalize RFC 4256 SUBMETHODS into a comma-separated string."
+  (cond
+    ((null submethods) "")
+    ((stringp submethods) submethods)
+    ((listp submethods)
+     (unless (every #'stringp submethods)
+       (error 'auth-error :message "keyboard-interactive submethods must be strings"))
+     (if submethods
+         (format nil "~{~A~^,~}" submethods)
+         ""))
+    (t
+      (error 'auth-error :message "keyboard-interactive submethods must be NIL, a string, or a list of strings"))))
+
+(defun octets-to-utf-8-string (octets)
+  "Decode OCTETS as UTF-8 text."
+  (babel:octets-to-string octets :encoding :utf-8))
+
+(defun filter-control-characters (text)
+  "Replace control characters in TEXT with safe caret sequences."
+  (with-output-to-string (out)
+    (loop for ch across text
+          for code = (char-code ch)
+          do (cond
+               ((or (char= ch #\Tab)
+                    (char= ch #\Return)
+                    (char= ch #\Newline))
+                (write-char ch out))
+               ((<= code 31)
+                (write-char #\^ out)
+                (write-char (code-char (+ 64 code)) out))
+               ((= code 127)
+                (write-char #\^ out)
+                (write-char #\? out))
+               (t
+                (write-char ch out))))))
+
+(defun normalize-auth-method-name (method)
+  (etypecase method
+    (string method)
+    (symbol (string-downcase (symbol-name method)))))
+
+(defun auth-method-allowed-p (method allowed-methods)
+  (member (normalize-auth-method-name method) allowed-methods :test #'string=))
+
+(defun signal-auth-partial-success (attempted-method allowed-methods continuation)
+  (restart-case
+      (progn
+        (signal 'auth-partial-success
+                :attempted-method attempted-method
+                :allowed-methods allowed-methods
+                :partial-success-p t)
+        (error 'auth-error
+               :message (format nil
+                                "~A authentication partially succeeded; server allows: ~{~A~^, ~}"
+                                attempted-method
+                                allowed-methods)))
+    (continue-authentication (method &rest args)
+      :report (lambda (s)
+                (format s "Continue authentication with one of: ~{~A~^, ~}"
+                        allowed-methods))
+      (let ((method-name (normalize-auth-method-name method)))
+        (unless (auth-method-allowed-p method-name allowed-methods)
+          (error 'auth-error
+                 :message (format nil
+                                  "server does not allow authentication method ~S; allowed: ~{~A~^, ~}"
+                                  method-name
+                                  allowed-methods)))
+        (funcall continuation method-name args)))))
+
+(defun parse-keyboard-interactive-info-request (payload)
+  "Parse SSH_MSG_USERAUTH_INFO_REQUEST payload.
+
+   Returns NAME, INSTRUCTION, LANGUAGE-TAG, and PROMPTS.
+   PROMPTS is a list of (:PROMPT <string> :ECHO <boolean>) plists."
+  (unless (= (aref payload 0) +msg-userauth-info-request+)
+    (error 'auth-error
+           :message (format nil "unexpected message ~D while parsing keyboard-interactive info request"
+                            (aref payload 0))))
+  (let* ((buf (make-read-buffer payload :start 1))
+         (name (octets-to-utf-8-string (read-string* buf)))
+         (instruction (octets-to-utf-8-string (read-string* buf)))
+         (language-tag (octets-to-utf-8-string (read-string* buf)))
+         (num-prompts (read-uint32 buf))
+         (prompts '()))
+    (loop repeat num-prompts
+          do (let ((prompt (octets-to-utf-8-string (read-string* buf)))
+                    (echo (read-boolean buf)))
+                (push (list :prompt prompt :echo echo) prompts)))
+    (values name instruction language-tag (nreverse prompts))))
+
+(defun encode-keyboard-interactive-info-response (responses)
+  "Encode SSH_MSG_USERAUTH_INFO_RESPONSE with RESPONSES.
+
+   RESPONSES must be a list of strings.
+
+   Returns the encoded packet payload octet vector."
+  (unless (listp responses)
+    (error 'auth-error :message "keyboard-interactive callback must return a list of strings"))
+  (unless (every #'stringp responses)
+    (error 'auth-error :message "keyboard-interactive callback responses must be strings"))
+  (let ((buf (make-write-buffer)))
+    (write-byte* buf +msg-userauth-info-response+)
+    (ssh/buffer:write-uint32 buf (length responses))
+    (dolist (response responses)
+      (write-string* buf (utf-8-to-octets response)))
+    (buffer-to-octets buf)))
+
+(defun make-keyboard-interactive-cli-callback (&key
+                                                 (input *standard-input*)
+                                                 (output *standard-output*)
+                                                 (reader #'read-line)
+                                                 no-echo-reader
+                                                 (display-name-p t)
+                                                 (display-instruction-p t)
+                                                 (prompt-suffix " ")
+                                                 (no-echo-suffix " [hidden] "))
+  "Build a keyboard-interactive callback that reads answers from INPUT.
+
+INPUT is the stream passed to the response reader.
+OUTPUT is the stream that receives the server-supplied name, instruction, and prompt text.
+READER is a callable for prompts whose :ECHO flag is true.
+NO-ECHO-READER is a callable for prompts whose :ECHO flag is false.
+ If NO-ECHO-READER is NIL, READER is used for both prompt kinds.
+DISPLAY-NAME-P controls whether NAME is printed when it is non-empty.
+DISPLAY-INSTRUCTION-P controls whether INSTRUCTION is printed when it is non-empty.
+PROMPT-SUFFIX is appended after echoed prompts.
+NO-ECHO-SUFFIX is appended after prompts whose :ECHO flag is false.
+
+Returns a function of (name instruction language-tag prompts) that returns a list of response strings."
+  (let ((silent-reader (or no-echo-reader reader)))
+    (lambda (name instruction language-tag prompts)
+      (declare (ignore language-tag))
+      (when (and display-name-p (plusp (length name)))
+        (format output "~A~%" name))
+      (when (and display-instruction-p (plusp (length instruction)))
+        (format output "~A~%" instruction))
+      (loop for prompt in prompts
+            collect (let* ((prompt-text (getf prompt :prompt))
+                           (echo-p (getf prompt :echo))
+                           (suffix (if echo-p prompt-suffix no-echo-suffix))
+                           (prompt-reader (if echo-p reader silent-reader)))
+                      (format output "~A~A" prompt-text suffix)
+                      (finish-output output)
+                      (multiple-value-bind (response eof-p)
+                          (funcall prompt-reader input)
+                        (declare (ignore eof-p))
+                        response))))))
 
 (defun rsa-key-type-p (key-type)
   (or (string= key-type "ssh-rsa")
@@ -168,10 +339,9 @@
       (#.+msg-userauth-success+ t)
       (#.+msg-userauth-failure+
        (multiple-value-bind (methods partial) (parse-failure reply)
-         (declare (ignore partial))
-         (error 'auth-error
-                :message (format nil "password authentication failed; server allows: ~{~A~^, ~}"
-                                 methods))))
+         (handle-auth-failure +auth-password+ methods partial
+                              (lambda (method args)
+                                (continue-authentication-with-method transport username method args methods)))))
       (t (error 'auth-error
                 :message (format nil "unexpected message ~D during password auth"
                                  (aref reply 0)))))))
@@ -260,35 +430,145 @@
         (#.+msg-userauth-success+ t)
         (#.+msg-userauth-failure+
          (multiple-value-bind (methods partial) (parse-failure reply)
-           (declare (ignore partial))
-           (error 'auth-error
-                  :message (format nil
-                                   "publickey authentication failed; server allows: ~{~A~^, ~}"
-                                   methods))))
+           (handle-auth-failure +auth-publickey+ methods partial
+                                (lambda (method args)
+                                  (continue-authentication-with-method transport username method args methods)))))
         (t (error 'auth-error
                   :message (format nil "unexpected message ~D during publickey auth"
                                    (aref reply 0))))))))
 
+(defun try-keyboard-interactive (transport username callback &key submethods)
+  "Attempt keyboard-interactive authentication (RFC 4256)."
+  (unless callback
+    (error 'auth-error :message "keyboard-interactive authentication requires a callback"))
+  (unless (functionp callback)
+    (error 'auth-error :message "keyboard-interactive callback must be a function"))
+  (let ((request-buf (make-write-buffer)))
+    (write-byte* request-buf +msg-userauth-request+)
+    (write-string* request-buf username)
+    (write-string* request-buf +service-connection+)
+    (write-string* request-buf +auth-keyboard-interactive+)
+    (write-string* request-buf "")
+    (write-string* request-buf (normalize-submethods submethods))
+    (transport-send transport (buffer-to-octets request-buf)))
+  (loop
+    (let ((reply (recv-auth-response transport)))
+      (case (aref reply 0)
+        (#.+msg-userauth-success+
+         (return t))
+        (#.+msg-userauth-failure+
+         (multiple-value-bind (methods partial) (parse-failure reply)
+           (handle-auth-failure +auth-keyboard-interactive+ methods partial
+                                (lambda (method args)
+                                  (continue-authentication-with-method transport username method args methods)))))
+        (#.+msg-userauth-info-request+
+         (multiple-value-bind (name instruction language-tag prompts)
+             (parse-keyboard-interactive-info-request reply)
+           (let* ((responses (funcall callback name instruction language-tag prompts))
+                  (prompt-count (length prompts)))
+             (unless (listp responses)
+               (error 'auth-error :message "keyboard-interactive callback must return a list of strings"))
+             (unless (= (length responses) prompt-count)
+               (error 'auth-error
+                      :message (format nil
+                                       "keyboard-interactive callback returned ~D responses for ~D prompts"
+                                       (length responses)
+                                       prompt-count)))
+             (transport-send transport
+                             (encode-keyboard-interactive-info-response responses)))))
+        (t
+         (error 'auth-error
+                :message (format nil "unexpected message ~D during keyboard-interactive auth"
+                                 (aref reply 0))))))))
+
+(defun handle-auth-failure (attempted-method allowed-methods partial continuation)
+  (if partial
+      (signal-auth-partial-success attempted-method allowed-methods continuation)
+      (error 'auth-error
+             :message (format nil "~A authentication failed; server allows: ~{~A~^, ~}"
+                              attempted-method
+                              allowed-methods))))
+
+(defun continue-authentication-with-method (transport username method args allowed-methods)
+  (let ((method-name (normalize-auth-method-name method)))
+    (unless (auth-method-allowed-p method-name allowed-methods)
+      (error 'auth-error
+             :message (format nil
+                              "server does not allow authentication method ~S; allowed: ~{~A~^, ~}"
+                              method-name
+                              allowed-methods)))
+    (cond
+      ((string= method-name +auth-password+)
+       (destructuring-bind (password &rest rest) args
+         (when rest
+           (error 'auth-error
+                  :message "password continuation takes exactly one argument"))
+         (try-password transport username password)))
+      ((string= method-name +auth-publickey+)
+       (destructuring-bind (identity &optional passphrase &rest rest) args
+         (when rest
+           (error 'auth-error
+                  :message "publickey continuation takes identity and optional passphrase"))
+         (let ((key-info (load-private-key identity :passphrase passphrase)))
+           (try-publickey transport username key-info))))
+      ((string= method-name +auth-keyboard-interactive+)
+       (destructuring-bind (callback &optional submethods &rest rest) args
+         (when rest
+           (error 'auth-error
+                  :message "keyboard-interactive continuation takes callback and optional submethods"))
+         (try-keyboard-interactive transport username callback :submethods submethods)))
+      (t
+       (error 'auth-error
+              :message (format nil "unsupported authentication method: ~S" method-name))))))
+
 ;;;; Public entry point
 
-(defun authenticate (transport username &key password identity passphrase)
+(defun authenticate (transport username
+                     &key password
+                       identity
+                       passphrase
+                       keyboard-interactive-callback
+                       keyboard-interactive-submethods)
   "Authenticate USERNAME on TRANSPORT.
 
-   Exactly one of PASSWORD or IDENTITY must be supplied.
+Authentication methods are tried in this priority order:
+1. PASSWORD
+2. IDENTITY
+3. KEYBOARD-INTERACTIVE-CALLBACK
+4. 'none' probe (for method discovery only)
 
-   PASSWORD    — a string; uses the 'password' auth method.
-   IDENTITY    — a pathname or namestring to a private key file;
-                 uses the 'publickey' auth method.
-   PASSPHRASE  — a string; passphrase for an encrypted private key.
-                 Required when IDENTITY points to a passphrase-protected key.
+PASSWORD — a string; uses the 'password' auth method.
+IDENTITY — a pathname or namestring to a private key file;
+ uses the 'publickey' auth method.
+PASSPHRASE — a string; passphrase for an encrypted private key.
+ Required when IDENTITY points to a passphrase-protected key.
 
-   Signals AUTH-ERROR on failure."
+KEYBOARD-INTERACTIVE-CALLBACK — function used by keyboard-interactive auth.
+ Called as (fn name instruction language-tag prompts).
+NAME is the server-supplied authentication name string.
+INSTRUCTION is the server-supplied instruction string.
+LANGUAGE-TAG is the server-supplied language tag string.
+PROMPTS is a list of plists; each plist contains :PROMPT, the text to display,
+ and :ECHO, a boolean indicating whether typed input should be echoed.
+The callback must return a list of response strings, one per prompt, in order.
+
+KEYBOARD-INTERACTIVE-SUBMETHODS — NIL, a comma-separated string, or a list of
+ submethod strings.
+
+Returns T on success, signals AUTH-PARTIAL-SUCCESS when the server accepts the
+current method but requires continuation, or signals AUTH-ERROR on failure."
   (cond
     (password
      (try-password transport username password))
     (identity
      (let ((key-info (load-private-key identity :passphrase passphrase)))
        (try-publickey transport username key-info)))
+    (keyboard-interactive-callback
+     (try-keyboard-interactive transport username keyboard-interactive-callback
+                               :submethods keyboard-interactive-submethods))
+    (keyboard-interactive-submethods
+     (error 'auth-error
+            :message "keyboard-interactive submethods were provided without a callback"))
     (t
      ;; Fall back to probing with 'none' to get the method list
      (let ((methods (try-none transport username)))

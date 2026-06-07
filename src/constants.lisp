@@ -17,12 +17,14 @@
    ;; KEX ECDH — curve25519-sha256 and generic ECDH (RFC 5656)
    #:+msg-kex-ecdh-init+
    #:+msg-kex-ecdh-reply+
-   ;; User authentication (RFC 4252)
+   ;; User authentication (RFC 4252, RFC 4256)
    #:+msg-userauth-request+
    #:+msg-userauth-failure+
    #:+msg-userauth-success+
    #:+msg-userauth-banner+
    #:+msg-userauth-pk-ok+
+   #:+msg-userauth-info-request+
+   #:+msg-userauth-info-response+
    ;; Connection protocol (RFC 4254)
    #:+msg-global-request+
    #:+msg-request-success+
@@ -118,6 +120,10 @@
 (defconstant +msg-userauth-success+ 52)
 (defconstant +msg-userauth-banner+  53)
 (defconstant +msg-userauth-pk-ok+   60)
+;; RFC 4256 method-specific messages.  Message number 60 overlaps with
+;; SSH_MSG_USERAUTH_PK_OK (RFC 4252) depending on active auth method.
+(defconstant +msg-userauth-info-request+  60)
+(defconstant +msg-userauth-info-response+ 61)
 
 ;;; Connection protocol messages (RFC 4254 §9)
 (defconstant +msg-global-request+            80)

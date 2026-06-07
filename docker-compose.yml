@@ -19,3 +19,37 @@ services:
     ports:
       - "127.0.0.1:2224:22"
     command: ["-o", "PubkeyAcceptedAlgorithms=ssh-rsa"]
+  sshd-partial-success:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "127.0.0.1:2226:22"
+    command:
+      - "-o"
+      - "KbdInteractiveAuthentication=yes"
+      - "-o"
+      - "ChallengeResponseAuthentication=yes"
+      - "-o"
+      - "UsePAM=yes"
+      - "-o"
+      - "AuthenticationMethods=publickey,keyboard-interactive"
+      - "-o"
+      - "PasswordAuthentication=no"
+  sshd-keyboard-interactive:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "127.0.0.1:2225:22"
+    command:
+      - "-o"
+      - "KbdInteractiveAuthentication=yes"
+      - "-o"
+      - "ChallengeResponseAuthentication=yes"
+      - "-o"
+      - "UsePAM=yes"
+      - "-o"
+      - "AuthenticationMethods=keyboard-interactive"
+      - "-o"
+      - "PasswordAuthentication=no"

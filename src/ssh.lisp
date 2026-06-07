@@ -40,7 +40,12 @@
                 #:transport-error)
   (:import-from #:ssh/auth
                 #:authenticate
-                #:auth-error)
+                #:make-keyboard-interactive-cli-callback
+                #:auth-error
+                #:auth-partial-success
+                #:auth-partial-success-allowed-methods
+                #:auth-partial-success-attempted-method
+                #:auth-partial-success-partial-success-p)
   (:import-from #:ssh/session
                 #:ssh-channel-stream
                 #:ssh-channel-stream-channel
@@ -87,9 +92,15 @@
    ;; Key utilities
    #:load-private-key
    #:public-key-fingerprint
+   ;; Keyboard-interactive helper
+   #:make-keyboard-interactive-cli-callback
    ;; Conditions
    #:transport-error
    #:auth-error
+   #:auth-partial-success
+   #:auth-partial-success-allowed-methods
+   #:auth-partial-success-attempted-method
+   #:auth-partial-success-partial-success-p
    #:key-error
    #:key-needs-passphrase
    #:key-needs-passphrase-path
@@ -109,6 +120,8 @@
                   password
                   identity
                   passphrase
+                  keyboard-interactive-callback
+                  keyboard-interactive-submethods
                   known-hosts-path
                   (strict-host-checking :unset))
   "Connect to HOST and authenticate, transparently honouring ~/.ssh/config.
@@ -123,9 +136,13 @@
    IDENTITY    — path to a private key file; use public-key authentication.
                  Falls back to the first IdentityFile in the config.
    PASSPHRASE  — passphrase string for a passphrase-protected private key.
-                 Supply this together with IDENTITY when the key is encrypted.
-                 When omitted and the key is encrypted, KEY-NEEDS-PASSPHRASE
-                 is signalled with a SUPPLY-PASSPHRASE restart available.
+                  Supply this together with IDENTITY when the key is encrypted.
+                  When omitted and the key is encrypted, KEY-NEEDS-PASSPHRASE
+                  is signalled with a SUPPLY-PASSPHRASE restart available.
+   KEYBOARD-INTERACTIVE-CALLBACK — callback function used by
+                  keyboard-interactive authentication.
+   KEYBOARD-INTERACTIVE-SUBMETHODS — NIL, comma-separated string, or list
+                  of submethod strings for keyboard-interactive.
    KNOWN-HOSTS-PATH      — override the default ~/.ssh/known_hosts path.
    STRICT-HOST-CHECKING  — T to refuse changed host keys (the default),
                            NIL to accept them with a warning.
@@ -154,9 +171,11 @@
     (handler-case
         (progn
           (authenticate transport effective-user
-                        :password password
-                        :identity (when effective-id (pathname effective-id))
-                        :passphrase passphrase)
+                         :password password
+                         :identity (when effective-id (pathname effective-id))
+                         :passphrase passphrase
+                         :keyboard-interactive-callback keyboard-interactive-callback
+                         :keyboard-interactive-submethods keyboard-interactive-submethods)
           (%make-client :transport transport))
       (error (e)
         (ignore-errors (transport-disconnect transport))
