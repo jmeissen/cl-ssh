@@ -33,6 +33,7 @@
                 #:+extended-data-stderr+
                 #:+open-administratively-prohibited+)
   (:import-from #:ssh/buffer
+                #:octets-to-ascii
                 #:make-write-buffer #:write-byte* #:write-uint32 #:write-boolean
                 #:write-string* #:write-raw-bytes #:buffer-to-octets
                 #:make-read-buffer #:read-byte* #:read-uint32 #:read-string*
@@ -340,7 +341,7 @@
       (#.+msg-channel-request+
        (let* ((buf        (make-read-buffer pkt :start 1))
               (local-id   (read-uint32 buf))
-              (req-type   (map 'string #'code-char (read-string* buf)))
+              (req-type   (octets-to-ascii (read-string* buf)))
               (want-reply (read-boolean buf))
               (ch         (%find-channel conn local-id)))
          (cond

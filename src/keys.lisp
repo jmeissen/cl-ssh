@@ -24,6 +24,7 @@
                 #:+host-key-rsa-sha2-256+
                 #:+host-key-rsa-sha2-512+)
   (:import-from #:ssh/buffer
+                #:octets-to-ascii
                 #:make-read-buffer
                 #:read-byte*
                 #:read-uint32
@@ -131,9 +132,9 @@
 
 (defun parse-public-key-blob (blob)
   "Parse an SSH public key BLOB (the inner bytes, without length prefix).
-   Returns a list (:type <string> :key <ironclad-key>)."
+Returns a list (:type <string> :key <ironclad-key>)."
   (let* ((buf      (make-read-buffer blob))
-         (key-type (map 'string #'code-char (read-string* buf))))
+         (key-type (octets-to-ascii (read-string* buf))))
     (cond
       ((string= key-type +host-key-ed25519+)
        (let ((pk-bytes (read-string* buf)))
@@ -157,9 +158,9 @@
 
 (defun parse-signature-blob (blob)
   "Parse an SSH signature BLOB.
-   Returns a list (:algorithm <string> :bytes <octet-vector>)."
+Returns a list (:algorithm <string> :bytes <octet-vector>)."
   (let* ((buf       (make-read-buffer blob))
-         (algo      (map 'string #'code-char (read-string* buf)))
+         (algo      (octets-to-ascii (read-string* buf)))
          (sig-bytes (read-string* buf)))
     (list :algorithm algo :bytes sig-bytes)))
 
@@ -391,8 +392,8 @@
                    (= (aref magic (length +openssh-key-magic+)) 0))
         (error 'key-error :message "not an OpenSSH private key (bad magic)")))
     ;; Cipher, KDF, kdf-options
-    (let* ((cipher-name  (map 'string #'code-char (read-string* buf)))
-           (kdf-name     (map 'string #'code-char (read-string* buf)))
+    (let* ((cipher-name  (octets-to-ascii (read-string* buf)))
+           (kdf-name     (octets-to-ascii (read-string* buf)))
            (kdf-options  (read-string* buf))   ; raw bytes; non-empty when kdf != "none"
            (encrypted-p  (not (string= cipher-name "none"))))
       ;; Validate KDF when the key is encrypted
@@ -444,7 +445,7 @@
             (error 'key-error
                    :message "OpenSSH private key check values mismatch — wrong passphrase or corrupt file")))
         ;; Key type string followed by key-type-specific fields
-        (let ((key-type (map 'string #'code-char (read-string* pbuf))))
+        (let ((key-type (octets-to-ascii (read-string* pbuf))))
           (cond
             ((string= key-type +host-key-ed25519+)
              ;; Ed25519: string(public-key 32B) string(private-key 64B: seed||pub)

@@ -14,7 +14,8 @@
     #:read-byte* #:read-boolean #:read-uint32 #:read-uint64
     #:read-string* #:read-mpint #:read-name-list #:read-raw-bytes
     #:read-remaining-bytes
-    #:buffer-underflow))
+    #:buffer-underflow
+    #:buffer-format-error))
 
 (in-package :ssh/tests/buffer)
 
@@ -95,6 +96,26 @@
   (let ((buf (make-write-buffer)))
     (write-string* buf "AB")
     (is equalp (octets 0 0 0 2 #x41 #x42) (buffer-to-octets buf))))
+
+(define-test string-octet-vector-preserves-raw-bytes
+  :parent (:ssh/tests ssh/tests)
+  (let ((buf (make-write-buffer))
+        (raw (octets 0 #x80 #xff 10)))
+    (write-string* buf raw)
+    (is equalp (octets 0 0 0 4 0 #x80 #xff 10)
+        (buffer-to-octets buf))
+    (is equalp raw
+        (read-string* (make-read-buffer (buffer-to-octets buf))))))
+
+(define-test string-character-input-is-us-ascii
+  :parent (:ssh/tests ssh/tests)
+  (let ((buf (make-write-buffer)))
+    (write-string* buf "ssh-ed25519")
+    (is equalp (octets 0 0 0 11
+                       #x73 #x73 #x68 #x2d #x65 #x64 #x32 #x35 #x35 #x31 #x39)
+        (buffer-to-octets buf)))
+  (fail (write-string* (make-write-buffer) "é")
+        'buffer-format-error))
 
 (define-test string-roundtrip
   :parent (:ssh/tests ssh/tests)
@@ -181,6 +202,13 @@
          (rbuf  (progn (write-name-list buf names)
                        (make-read-buffer (buffer-to-octets buf)))))
     (is equal names (read-name-list rbuf))))
+
+(define-test name-list-is-us-ascii
+  :parent (:ssh/tests ssh/tests)
+  (fail (write-name-list (make-write-buffer) '("password" "méthod"))
+        'buffer-format-error)
+  (fail (read-name-list (make-read-buffer (octets 0 0 0 1 #xff)))
+        'buffer-format-error))
 
 ;;; ---- underflow condition ------------------------------------------------
 

@@ -34,6 +34,7 @@
                 #:+ext-info-c+
                 #:+disconnect-protocol-error+)
   (:import-from #:ssh/buffer
+                #:octets-to-ascii
                 #:make-write-buffer #:write-byte* #:write-uint32 #:write-string*
                 #:buffer-to-octets
                 #:make-read-buffer #:read-byte* #:read-uint32 #:read-string*
@@ -44,11 +45,11 @@
                 #:packet-stream-packets-out #:packet-stream-packets-in
                 #:packet-stream-bytes-out #:packet-stream-bytes-in)
   (:import-from #:ssh/algorithms
-                 #:kexinit-payload #:parse-kexinit #:kexinit-kex-algorithms
-                 #:negotiate-algorithms
-                 #:negotiated-kex #:negotiated-host-key
-                 #:negotiated-cipher-c2s #:negotiated-cipher-s2c
-                 #:negotiated-mac-c2s #:negotiated-mac-s2c)
+                #:kexinit-payload #:parse-kexinit #:kexinit-kex-algorithms
+                #:negotiate-algorithms
+                #:negotiated-kex #:negotiated-host-key
+                #:negotiated-cipher-c2s #:negotiated-cipher-s2c
+                #:negotiated-mac-c2s #:negotiated-mac-s2c)
   (:import-from #:ssh/kex
                 #:perform-kex-curve25519
                 #:perform-kex-dh-group14
@@ -258,10 +259,9 @@
         (let ((count (read-uint32 buf))
               (extensions '()))
           (loop repeat count
-                do
-            (push (cons (map 'string #'code-char (read-string* buf))
-                        (read-string* buf))
-                  extensions))
+                do (push (cons (octets-to-ascii (read-string* buf))
+                               (read-string* buf))
+                         extensions))
           (when (plusp (read-remaining-bytes buf))
             (error 'transport-error
                    :message "malformed SSH_MSG_EXT_INFO: trailing bytes"))
@@ -281,13 +281,17 @@
 
 (defun process-ext-info (transport payload)
   "Update TRANSPORT state from an SSH_MSG_EXT_INFO payload."
-  (let ((extensions (parse-ext-info-payload payload)))
-    (setf (transport-server-sig-algs transport)
-          (let ((entry (assoc "server-sig-algs" extensions :test #'string=)))
-            (when entry
-              (csv-string-to-name-list
-               (map 'string #'code-char (cdr entry))))))
-    nil))
+  (handler-case
+      (let ((extensions (parse-ext-info-payload payload)))
+        (setf (transport-server-sig-algs transport)
+              (let ((entry (assoc "server-sig-algs" extensions :test #'string=)))
+                (when entry
+                  (csv-string-to-name-list
+                   (octets-to-ascii (cdr entry))))))
+        nil)
+    (ssh/buffer:buffer-format-error (c)
+      (error 'transport-error
+             :message (format nil "malformed SSH_MSG_EXT_INFO: ~A" c)))))
 
 (defun validate-server-kexinit (server-kexinit)
   "Reject role-incorrect extension markers in the server KEXINIT."

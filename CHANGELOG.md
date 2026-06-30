@@ -13,6 +13,10 @@
   key authentication selection (RFC 8308 §3.1)
 - Integration tests through Docker and an additional integration testing system.
 
+### Fixed
+- SSH data encoding, octets, US-ASCII, and UTF-8 where needed (RFC 4252 §5, §8; RFC
+  4254 §5)
+
 ## [0.2.0] - 2026-05-17
 
 ### Added

@@ -25,8 +25,11 @@
                 #:load-private-key
                 #:sign-auth-data
                 #:verify-host-key-signature
+                #:parse-public-key-blob
                 #:key-error
-                #:key-needs-passphrase))
+                #:key-needs-passphrase)
+  (:import-from :ssh/buffer
+                #:buffer-format-error))
 
 (in-package :ssh/tests/keys)
 
@@ -71,6 +74,54 @@
     (ssh/buffer:write-string* buf sig-algo)
     (ssh/buffer:write-string* buf raw-sig)
     (ssh/buffer:buffer-to-octets buf)))
+
+(defun signature-blob-with-raw-algorithm (algorithm-octets raw-sig)
+  (let ((buf (ssh/buffer:make-write-buffer)))
+    (ssh/buffer:write-string* buf algorithm-octets)
+    (ssh/buffer:write-string* buf raw-sig)
+    (ssh/buffer:buffer-to-octets buf)))
+
+(defun public-key-blob-with-raw-type (type-octets key-octets)
+  (let ((buf (ssh/buffer:make-write-buffer)))
+    (ssh/buffer:write-string* buf type-octets)
+    (ssh/buffer:write-string* buf key-octets)
+    (ssh/buffer:buffer-to-octets buf)))
+
+;;;; ---- Encoding boundaries -------------------------------------------------
+
+(define-test parse-public-key-blob-preserves-raw-key-bytes
+  :parent (:ssh/tests ssh/tests)
+  (let* ((raw-key (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element #xff))
+         (key-info (parse-public-key-blob
+                    (public-key-blob-with-raw-type
+                     (map '(vector (unsigned-byte 8)) #'char-code "ssh-ed25519")
+                     raw-key))))
+    (is string= "ssh-ed25519" (getf key-info :type))
+    (is equalp raw-key (ironclad:ed25519-key-y (getf key-info :key)))))
+
+(define-test parse-public-key-blob-rejects-non-ascii-key-type
+  :parent (:ssh/tests ssh/tests)
+  (fail (parse-public-key-blob
+         (public-key-blob-with-raw-type (ssh/tests:octets #xff)
+                                        (make-array 32 :element-type '(unsigned-byte 8)
+                                                       :initial-element 0)))
+        'buffer-format-error))
+
+(define-test parse-signature-blob-preserves-raw-signature-bytes
+  :parent (:ssh/tests ssh/tests)
+  (let* ((raw-sig (ssh/tests:octets 0 #x80 #xff 10))
+         (sig-info (ssh/keys::parse-signature-blob
+                    (signature-blob-with-raw-sig "ssh-ed25519" raw-sig))))
+    (is string= "ssh-ed25519" (getf sig-info :algorithm))
+    (is equalp raw-sig (getf sig-info :bytes))))
+
+(define-test parse-signature-blob-rejects-non-ascii-algorithm
+  :parent (:ssh/tests ssh/tests)
+  (fail (ssh/keys::parse-signature-blob
+         (signature-blob-with-raw-algorithm (ssh/tests:octets #xff)
+                                            (ssh/tests:octets 1 2 3)))
+        'buffer-format-error))
 
 ;;;; ---- Unencrypted keys (regression guard) --------------------------------
 

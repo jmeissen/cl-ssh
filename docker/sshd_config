@@ -7,7 +7,7 @@ PubkeyAuthentication yes
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 UsePAM no
-AllowUsers ssh-test
+AllowUsers ssh-tést
 AuthorizedKeysFile .ssh/authorized_keys
 Subsystem sftp internal-sftp
 PidFile /run/sshd.pid

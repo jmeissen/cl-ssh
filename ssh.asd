@@ -26,6 +26,7 @@
                (:file "tests/test-ssh")
                (:file "tests/test-transport")
                (:file "tests/test-auth")
+               (:file "tests/test-connection")
                (:file "tests/test-session")
                (:file "tests/test-keys"))
   :perform (test-op (op c)

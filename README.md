@@ -287,7 +287,8 @@ sbcl --disable-debugger --load .qlot/setup.lisp --eval '(asdf:test-system :ssh)'
 ## Integration tests
 
 Live integration tests run against Docker Compose OpenSSH services on
-`127.0.0.1:2222-2225` (default, RSA variants, and dedicated keyboard-interactive).
+`127.0.0.1:2222-2226` (default, RSA variants, dedicated keyboard-interactive,
+and partial-success authentication).
 
 ``` shell
 ./scripts/run-integration-tests.sh
@@ -298,4 +299,5 @@ Set `SSH_TEST_REBUILD=1` if you changed the Docker image or want a fresh rebuild
 If you want to drive them manually, set `SSH_TEST_HOST`, `SSH_TEST_PORT`,
 `SSH_TEST_RSA_SHA2_256_PORT`, `SSH_TEST_SSH_RSA_PORT`, `SSH_TEST_KBDINT_PORT`,
 `SSH_TEST_USER`, `SSH_TEST_PASSWORD`, and `SSH_TEST_KNOWN_HOSTS`, then run
-`asdf:test-system :ssh/integration-tests`.
+`asdf:test-system :ssh/integration-tests`. Banner coverage is enabled by
+`SSH_TEST_BANNER_PORT` with `SSH_TEST_BANNER_TEXT`.

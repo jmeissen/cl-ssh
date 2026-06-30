@@ -10,15 +10,6 @@
 
 (in-package :ssh/tests/session)
 
-(defun ascii-octets (string)
-  (let ((octets (make-array (length string) :element-type '(unsigned-byte 8)
-                            :adjustable t
-                            :fill-pointer (length string))))
-    (loop for ch across string
-          for i from 0
-          do (setf (aref octets i) (char-code ch)))
-    octets))
-
 (defclass fake-shell-socket ()
   ((ready-p :initform t :accessor fake-shell-socket-ready-p)))
 
@@ -30,10 +21,17 @@
          (stream (make-instance 'ssh-channel-stream
                                 :connection conn
                                 :channel channel)))
-    (setf (ssh/connection::channel-stdout-buffer channel) (ascii-octets buffer)
+    (setf (ssh/connection::channel-stdout-buffer channel) (ssh/buffer:utf-8-to-octets buffer)
           (ssh/connection::channel-eof-p channel) eof-p
           (ssh/connection::channel-close-p channel) close-p)
     (values stream channel socket)))
+
+(define-test shell-text-conversion-uses-utf8 :parent (:ssh/tests ssh/tests)
+  (let ((text "ssh-tést-値"))
+    (is equalp (ssh/buffer:utf-8-to-octets text)
+        (ssh/session::%string-to-octets text))
+    (is string= text
+        (ssh/session::%octets-to-string (ssh/buffer:utf-8-to-octets text)))))
 
 (define-test shell-read-line-signals-on-eof-when-empty :parent (:ssh/tests ssh/tests)
   (multiple-value-bind (stream channel socket)
@@ -59,6 +57,15 @@
     (multiple-value-bind (line missing-p)
         (shell-read-line stream :error-p nil)
       (is string= "abc" line)
+      (is eq :eof missing-p))))
+
+(define-test shell-read-line-decodes-utf8-text :parent (:ssh/tests ssh/tests)
+  (multiple-value-bind (stream channel socket)
+      (make-shell-stream :buffer "ssh-tést" :eof-p t)
+    (declare (ignore channel socket))
+    (multiple-value-bind (line missing-p)
+        (shell-read-line stream :error-p nil)
+      (is string= "ssh-tést" line)
       (is eq :eof missing-p))))
 
 (define-test shell-read-until-returns-partial-text-on-close :parent
@@ -100,6 +107,19 @@
     (multiple-value-bind (string status)
         (shell-read-until stream "__DONE__" :block-p nil)
       (is string= "pre" string)
+      (is eq :found status)
+      (multiple-value-bind (rest rest-status)
+          (shell-read-until stream nil :block-p nil)
+        (is string= "post" rest)
+        (is eq :blocked rest-status)))))
+
+(define-test shell-read-until-matches-utf8-marker :parent (:ssh/tests ssh/tests)
+  (multiple-value-bind (stream channel socket)
+      (make-shell-stream :buffer "pré終post")
+    (declare (ignore channel socket))
+    (multiple-value-bind (string status)
+        (shell-read-until stream "終" :block-p nil)
+      (is string= "pré" string)
       (is eq :found status)
       (multiple-value-bind (rest rest-status)
           (shell-read-until stream nil :block-p nil)
@@ -154,7 +174,7 @@
                  (lambda (conn predicate)
                    (declare (ignore conn predicate))
                    (incf dispatch-count)
-                   (loop for byte across (ascii-octets "net")
+                   (loop for byte across (ssh/buffer:utf-8-to-octets "net")
                          do (vector-push-extend byte
                                                 (ssh/connection::channel-stdout-buffer
                                                  channel)))

@@ -4,14 +4,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends openssh-server openssh-client ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -s /bin/sh ssh-test \
- && install -d -m 700 -o ssh-test -g ssh-test /home/ssh-test/.ssh
+RUN useradd --badname -m -s /bin/sh 'ssh-tést' \
+ && install -d -m 700 -o 'ssh-tést' -g 'ssh-tést' '/home/ssh-tést/.ssh'
 
 COPY tests/fixtures/keys/*.pub /tmp/ssh-keys/
-RUN cat /tmp/ssh-keys/*.pub > /home/ssh-test/.ssh/authorized_keys \
- && chown ssh-test:ssh-test /home/ssh-test/.ssh/authorized_keys \
- && chmod 600 /home/ssh-test/.ssh/authorized_keys \
- && echo 'ssh-test:cl-ssh-password' | chpasswd \
+RUN cat /tmp/ssh-keys/*.pub > '/home/ssh-tést/.ssh/authorized_keys' \
+ && chown 'ssh-tést:ssh-tést' '/home/ssh-tést/.ssh/authorized_keys' \
+ && chmod 600 '/home/ssh-tést/.ssh/authorized_keys' \
+ && printf '%s:%s\n' 'ssh-tést' 'cl-ssh-pässwörd-値' | chpasswd \
  && rm -rf /tmp/ssh-keys
 
 COPY docker/sshd_config /etc/ssh/sshd_config

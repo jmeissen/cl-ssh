@@ -39,6 +39,7 @@
                 #:make-read-buffer
                 #:read-byte*
                 #:read-string*
+                #:read-name-list
                 #:read-boolean
                 #:read-uint32
                 #:utf-8-to-octets)
@@ -101,14 +102,7 @@
 (defun parse-failure (payload)
   "Parse SSH_MSG_USERAUTH_FAILURE and return (values allowed-methods partial-success)."
   (let* ((buf     (make-read-buffer payload :start 1))
-         (methods (let ((raw (read-string* buf)))
-                    (if (zerop (length raw))
-                        '()
-                        (let ((csv (map 'string #'code-char raw)))
-                          (loop for start = 0 then (1+ end)
-                                for end   = (position #\, csv :start start)
-                                collect (subseq csv start end)
-                                while end)))))
+         (methods (read-name-list buf))
          (partial (read-boolean buf)))
     (values methods partial)))
 
@@ -148,6 +142,9 @@
                 (write-char #\? out))
                (t
                 (write-char ch out))))))
+
+(defun write-username (buf username)
+  (write-string* buf (utf-8-to-octets username)))
 
 (defun normalize-auth-method-name (method)
   (etypecase method
@@ -309,7 +306,7 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
    or :success if the server (unusually) accepts it."
   (let ((buf (make-write-buffer)))
     (write-byte*   buf +msg-userauth-request+)
-    (write-string* buf username)
+    (write-username buf username)
     (write-string* buf +service-connection+)
     (write-string* buf +auth-none+)
     (transport-send transport (buffer-to-octets buf)))
@@ -328,7 +325,7 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
   "Attempt password authentication (RFC 4252 §8)."
   (let ((buf (make-write-buffer)))
     (write-byte*   buf +msg-userauth-request+)
-    (write-string* buf username)
+    (write-username buf username)
     (write-string* buf +service-connection+)
     (write-string* buf +auth-password+)
     (write-boolean buf nil)           ; FALSE — not a password-change request
@@ -360,7 +357,7 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
     (let* ((pk-blob (buffer-to-octets pk-buf))
             (req-buf (make-write-buffer)))
       (write-byte*   req-buf +msg-userauth-request+)
-      (write-string* req-buf username)
+      (write-username req-buf username)
       (write-string* req-buf +service-connection+)
       (write-string* req-buf +auth-publickey+)
       (write-boolean req-buf nil)         ; FALSE — probe, no signature
@@ -407,7 +404,7 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
       ;; string("publickey") bool(true) string(algo) string(pk-blob)
       (write-string* sign-buf session-id)
       (write-byte* sign-buf +msg-userauth-request+)
-      (write-string* sign-buf username)
+      (write-username sign-buf username)
       (write-string* sign-buf +service-connection+)
       (write-string* sign-buf +auth-publickey+)
       (write-boolean sign-buf t)
@@ -417,7 +414,7 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
              (sig-blob  (sign-auth-data key-info auth-data :algorithm algorithm))
              (req-buf   (make-write-buffer)))
         (write-byte*   req-buf +msg-userauth-request+)
-        (write-string* req-buf username)
+        (write-username req-buf username)
         (write-string* req-buf +service-connection+)
         (write-string* req-buf +auth-publickey+)
         (write-boolean req-buf t)
@@ -445,7 +442,7 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
     (error 'auth-error :message "keyboard-interactive callback must be a function"))
   (let ((request-buf (make-write-buffer)))
     (write-byte* request-buf +msg-userauth-request+)
-    (write-string* request-buf username)
+    (write-username request-buf username)
     (write-string* request-buf +service-connection+)
     (write-string* request-buf +auth-keyboard-interactive+)
     (write-string* request-buf "")

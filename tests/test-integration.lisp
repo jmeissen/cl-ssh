@@ -66,7 +66,7 @@
       (make-integration-target
        :host (or (env-value "SSH_TEST_HOST") "127.0.0.1")
        :port (or port 2222)
-       :user (or (env-value "SSH_TEST_USER") "ssh-test")
+       :user (or (env-value "SSH_TEST_USER") "ssh-tést")
        :known-hosts known-hosts
        :password (env-value "SSH_TEST_PASSWORD")))))
 
@@ -74,7 +74,13 @@
   (env-value "SSH_TEST_PASSWORD"))
 
 (defun integration-user ()
-  (or (env-value "SSH_TEST_USER") "ssh-test"))
+  (or (env-value "SSH_TEST_USER") "ssh-tést"))
+
+(defun integration-banner-port ()
+  (env-port "SSH_TEST_BANNER_PORT"))
+
+(defun integration-banner-text ()
+  (env-value "SSH_TEST_BANNER_TEXT"))
 
 (defun integration-kbdint-port ()
   (env-port "SSH_TEST_KBDINT_PORT"))
@@ -115,6 +121,29 @@
     (is string= expected-output stdout)
     (is string= "" stderr)
     (is = 0 exit-code)))
+
+(defun run-command-octets (client command)
+  (let* ((conn (ssh/connection:make-connection (client-transport client)))
+         (ch (ssh/connection:open-channel conn ssh/constants:+channel-session+)))
+    (let ((extra (ssh/buffer:make-write-buffer)))
+      (ssh/buffer:write-string* extra command)
+      (unless (ssh/connection:channel-request conn ch ssh/constants:+request-exec+ t extra)
+        (error "server rejected exec request")))
+    (loop until (ssh/connection::channel-close-p ch)
+          do (ssh/connection:channel-dispatch-until
+              conn
+              (lambda (pkt)
+                (and (ssh/session::%pkt-for-channel-p pkt ch)
+                     (let ((type (aref pkt 0)))
+                       (or (= type ssh/constants:+msg-channel-data+)
+                           (= type ssh/constants:+msg-channel-extended-data+)
+                           (= type ssh/constants:+msg-channel-eof+)
+                           (= type ssh/constants:+msg-channel-close+)
+                           (= type ssh/constants:+msg-channel-request+)))))))
+    (ignore-errors (ssh/connection:channel-close conn ch))
+    (values (copy-seq (ssh/connection:channel-stdout-buffer ch))
+            (copy-seq (ssh/connection:channel-stderr-buffer ch))
+            (or (ssh/connection:channel-exit-status ch) 0))))
 
 (defun rsa-live-test (port expected-algorithm)
   (if port
@@ -230,6 +259,27 @@
         (skip "requires SSH_TEST_KBDINT_PORT and SSH_TEST_PASSWORD"
           (true t)))))
 
+(define-test userauth-banner-decodes-utf8-text
+  :parent (:ssh/integration-tests ssh/integration-tests)
+  (let* ((port (integration-banner-port))
+         (text (integration-banner-text))
+         (target (and port text (integration-target port))))
+    (if target
+        (let ((captured-output
+                (with-output-to-string (*standard-output*)
+                  (let ((client (connect (integration-target-host target)
+                                         :port (integration-target-port target)
+                                         :username (integration-target-user target)
+                                         :known-hosts-path (integration-target-known-hosts target)
+                                         :identity (fixture-path "id_ed25519_nopass")
+                                         :strict-host-checking t)))
+                    (unwind-protect
+                         nil
+                      (ignore-errors (disconnect client)))))))
+          (true (search text captured-output :test #'char=)))
+        (skip "requires SSH_TEST_BANNER_PORT and SSH_TEST_BANNER_TEXT"
+          (true t)))))
+
 (define-test keyboard-interactive-auth-fails-with-wrong-response
   :parent (:ssh/integration-tests ssh/integration-tests)
   (let* ((port (integration-kbdint-port))
@@ -300,6 +350,15 @@
       (is string= "out" stdout)
       (is string= "err" stderr)
       (is = 7 exit-code))))
+
+(define-test run-command-preserves-raw-channel-data-bytes
+  :parent (:ssh/integration-tests ssh/integration-tests)
+  (with-live-client (client :identity (fixture-path "id_ed25519_nopass"))
+    (multiple-value-bind (stdout stderr exit-code)
+        (run-command-octets client "printf '\\000\\200\\377'")
+      (is equal '(0 128 255) (map 'list #'identity stdout))
+      (is = 0 (length stderr))
+      (is = 0 exit-code))))
 
 (define-test rekey-after-time-limit-keeps-session-usable
   :parent (:ssh/integration-tests ssh/integration-tests)

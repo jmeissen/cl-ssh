@@ -36,7 +36,8 @@
    #:read-remaining-bytes
    #:read-buffer-length
    #:read-buffer-pos
-   #:utf-8-to-octets))
+   #:utf-8-to-octets
+   #:octets-to-ascii))
 
 (in-package #:ssh/buffer)
 
@@ -74,7 +75,13 @@
 
 (defun octets-to-ascii (octets)
   "Decode ASCII octets to a string."
-  (map 'string #'code-char octets))
+  (let ((result (make-string (length octets))))
+    (dotimes (i (length octets) result)
+      (let ((byte (aref octets i)))
+        (unless (< byte 128)
+          (error 'buffer-format-error
+                 :message (format nil "non-ASCII byte #x~2,'0X at index ~D" byte i)))
+        (setf (aref result i) (code-char byte))))))
 
 ;;;; Write buffer
 

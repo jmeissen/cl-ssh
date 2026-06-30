@@ -27,12 +27,17 @@
                 #:+msg-userauth-banner+
                 #:+msg-userauth-info-response+
                 #:+service-connection+
+                #:+auth-password+
+                #:+auth-publickey+
                 #:+auth-keyboard-interactive+))
 
 (in-package :ssh/tests/auth)
 
 (defun octets->string (octets)
   (map 'string #'code-char octets))
+
+(defun octets->utf8-string (octets)
+  (babel:octets-to-string octets :encoding :utf-8))
 
 (defun build-userauth-success ()
   (ssh/tests:octets +msg-userauth-success+))
@@ -47,7 +52,7 @@
 (defun build-userauth-banner (text &optional (language-tag ""))
   (let ((buf (make-write-buffer)))
     (write-byte* buf +msg-userauth-banner+)
-    (write-string* buf text)
+    (write-string* buf (utf-8-to-octets text))
     (write-string* buf language-tag)
     (buffer-to-octets buf)))
 
@@ -67,11 +72,45 @@
   (let ((buf (make-read-buffer payload)))
     (values
      (read-byte* buf)
-     (octets->string (read-string* buf))
+     (octets->utf8-string (read-string* buf))
      (octets->string (read-string* buf))
      (octets->string (read-string* buf))
      (octets->string (read-string* buf))
      (octets->string (read-string* buf)))))
+
+(defun decode-password-request (payload)
+  (let ((buf (make-read-buffer payload)))
+    (values
+     (read-byte* buf)
+     (read-string* buf)
+     (octets->string (read-string* buf))
+     (octets->string (read-string* buf))
+     (read-boolean buf)
+     (read-string* buf))))
+
+(defun decode-publickey-request (payload)
+  (let ((buf (make-read-buffer payload)))
+    (values
+     (read-byte* buf)
+     (read-string* buf)
+     (octets->string (read-string* buf))
+     (octets->string (read-string* buf))
+     (read-boolean buf)
+     (octets->string (read-string* buf))
+     (read-string* buf)
+     (read-string* buf))))
+
+(defun decode-publickey-signature-input (payload)
+  (let ((buf (make-read-buffer payload)))
+    (values
+     (read-string* buf)
+     (read-byte* buf)
+     (read-string* buf)
+     (octets->string (read-string* buf))
+     (octets->string (read-string* buf))
+     (read-boolean buf)
+     (octets->string (read-string* buf))
+     (read-string* buf))))
 
 (defun decode-info-response (payload)
   (let ((buf (make-read-buffer payload)))
@@ -105,6 +144,24 @@
       (setf (symbol-function 'ssh/transport:transport-send) original-send
             (symbol-function 'ssh/transport:transport-recv) original-recv))))
 
+(define-test password-auth-encodes-username-and-password-as-utf8
+  :parent (:ssh/tests ssh/tests)
+  (multiple-value-bind (result sent)
+      (run-with-mocked-auth-io
+       (list (build-userauth-success))
+       (lambda (transport)
+         (authenticate transport "ålîçé" :password "päss値")))
+    (true result)
+    (is = 1 (length sent))
+    (multiple-value-bind (message-type username service method change-request-p password)
+        (decode-password-request (first sent))
+      (is = +msg-userauth-request+ message-type)
+      (is equalp (utf-8-to-octets "ålîçé") username)
+      (is string= +service-connection+ service)
+      (is string= +auth-password+ method)
+      (false change-request-p)
+      (is equalp (utf-8-to-octets "päss値") password))))
+
 (define-test keyboard-interactive-initial-request-encoding
   :parent (:ssh/tests ssh/tests)
   (multiple-value-bind (result sent)
@@ -125,6 +182,73 @@
       (is string= +auth-keyboard-interactive+ method)
       (is string= "" language-tag)
       (is string= "otp,sms" submethods))))
+
+(define-test keyboard-interactive-encodes-username-as-utf8
+  :parent (:ssh/tests ssh/tests)
+  (multiple-value-bind (result sent)
+      (run-with-mocked-auth-io
+       (list (build-userauth-success))
+       (lambda (transport)
+         (ssh/auth::try-keyboard-interactive transport
+                                             "ålîçé"
+                                             (lambda (&rest _) (declare (ignore _)) '()))))
+    (true result)
+    (multiple-value-bind (message-type username service method language-tag submethods)
+        (decode-initial-keyboard-interactive-request (first sent))
+      (is = +msg-userauth-request+ message-type)
+      (is string= "ålîçé" username)
+      (is string= +service-connection+ service)
+      (is string= +auth-keyboard-interactive+ method)
+      (is string= "" language-tag)
+      (is string= "" submethods))))
+
+(define-test publickey-auth-encodes-username-as-utf8-in-request-and-signature-input
+  :parent (:ssh/tests ssh/tests)
+  (multiple-value-bind (private public)
+      (ironclad:generate-key-pair :ed25519)
+    (let ((key-info (list :type "ssh-ed25519"
+                          :private-key private
+                          :public-key public))
+          (session-id (ssh/tests:octets 9 8 7))
+          (signature-blob (ssh/tests:octets #xde #xad 0 #xff))
+          (auth-data nil)
+          (original-sign (symbol-function 'ssh/keys:sign-auth-data)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'ssh/keys:sign-auth-data)
+                   (lambda (_key-info data &key algorithm)
+                     (declare (ignore _key-info algorithm))
+                     (setf auth-data data)
+                     signature-blob))
+             (multiple-value-bind (result sent)
+                 (run-with-mocked-auth-io
+                  (list (build-userauth-success))
+                  (lambda (transport)
+                    (setf (ssh/transport:transport-session-id transport) session-id)
+                    (ssh/auth::try-publickey transport "ålîçé" key-info)))
+               (true result)
+               (is = 1 (length sent))
+               (multiple-value-bind (message-type username service method signed-p algorithm pk-blob sent-signature)
+                   (decode-publickey-request (first sent))
+                 (is = +msg-userauth-request+ message-type)
+                 (is equalp (utf-8-to-octets "ålîçé") username)
+                 (is string= +service-connection+ service)
+                 (is string= +auth-publickey+ method)
+                 (true signed-p)
+                 (is string= "ssh-ed25519" algorithm)
+                 (true (> (length pk-blob) 0))
+                 (is equalp signature-blob sent-signature))
+               (multiple-value-bind (signed-session-id message-type username service method signed-p algorithm pk-blob)
+                   (decode-publickey-signature-input auth-data)
+                 (is equalp session-id signed-session-id)
+                 (is = +msg-userauth-request+ message-type)
+                 (is equalp (utf-8-to-octets "ålîçé") username)
+                 (is string= +service-connection+ service)
+                 (is string= +auth-publickey+ method)
+                 (true signed-p)
+                 (is string= "ssh-ed25519" algorithm)
+                 (true (> (length pk-blob) 0)))))
+        (setf (symbol-function 'ssh/keys:sign-auth-data) original-sign)))))
 
 (define-test keyboard-interactive-parse-info-request
   :parent (:ssh/tests ssh/tests)
@@ -429,7 +553,7 @@
 (define-test keyboard-interactive-skips-banner-before-info-request
   :parent (:ssh/tests ssh/tests)
   (let* ((banner (concatenate 'string
-                              "Welcome"
+                              "Välkommen 値"
                               (string (code-char 27))
                               "[2J"
                               (string (code-char 7))
@@ -453,10 +577,10 @@
               (is = 2 (length sent))
               (multiple-value-bind (message-type responses)
                   (decode-info-response (second sent))
-                (is = +msg-userauth-info-response+ message-type)
-                (is equalp (utf-8-to-octets "000000") (first responses))))))
+              (is = +msg-userauth-info-response+ message-type)
+              (is equalp (utf-8-to-octets "000000") (first responses))))))
     (is string=
-        (concatenate 'string "Welcome^[[2J^G" (string #\Tab) "OK" (string #\Newline))
+        (concatenate 'string "Välkommen 値^[[2J^G" (string #\Tab) "OK" (string #\Newline))
         stdout)))
 (define-test authenticate-supports-keyboard-interactive-callback
   :parent (:ssh/tests ssh/tests)

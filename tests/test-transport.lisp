@@ -181,6 +181,22 @@
     (is equal '("rsa-sha2-512" "ssh-rsa")
         (ssh/transport::transport-server-sig-algs transport))))
 
+(define-test ext-info-extension-names-are-us-ascii
+  :parent (:ssh/tests ssh/tests)
+  (let ((payload (ext-info-payload (list (coerce '(#xff) '(vector (unsigned-byte 8)))
+                                        (ssh/tests:octets 1 2 3)))))
+    (fail (ssh/transport::parse-ext-info-payload payload)
+          'ssh/transport:transport-error)))
+
+(define-test ext-info-server-sig-algs-is-us-ascii-name-list
+  :parent (:ssh/tests ssh/tests)
+  (let ((payload (ext-info-payload (list "server-sig-algs"
+                                        (ssh/tests:octets #x73 #x73 #x68 #xff)))))
+    (fail (ssh/transport::process-ext-info
+           (ssh/transport::make-transport)
+           payload)
+          'ssh/transport:transport-error)))
+
 (define-test ext-info-replaces-previous-server-sig-algs
   :parent (:ssh/tests ssh/tests)
   (let* ((payload (ext-info-payload (list "other-extension" (coerce '(1 2 3) '(vector (unsigned-byte 8))))))

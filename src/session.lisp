@@ -237,25 +237,18 @@ Returns two values: the byte (when available) and a status keyword - being one o
 ;;;; Convenience shell I/O helpers
 
 (defun %string-to-octets (string)
-  (let ((octets (make-array (length string) :element-type '(unsigned-byte 8))))
-    (loop for ch across string
-          for i from 0
-          for code = (char-code ch)
-          do (when (> code 255)
-               (error "Cannot write non-octet character ~S to SSH shell stream" ch))
-             (setf (aref octets i) code))
-    octets))
+  (ssh/buffer:utf-8-to-octets string))
 
 (defun %octets-to-string (octets &key (start 0) end)
-  (map 'string #'code-char (subseq octets start end)))
+  (babel:octets-to-string (subseq octets start end) :encoding :utf-8))
 
 (defun shell-write-line (stream line)
   "Write LINE plus a newline to shell STREAM, then force output.
 
 STREAM is the bidirectional binary stream returned by OPEN-SHELL.
 
-LINE is encoded as single-byte character codes, matching the rest of
-cl-ssh's channel stream API."
+LINE is encoded as UTF-8 text. Use WRITE-BYTE or WRITE-SEQUENCE on the
+binary stream when sending raw channel bytes."
   (write-sequence (%string-to-octets line) stream)
   (write-byte 10 stream)
   (force-output stream)
@@ -410,10 +403,10 @@ then it may also be one of :EOF or :CLOSED."
                            (= type ssh/constants:+msg-channel-request+)))))))
     ;; Send close
     (ignore-errors (channel-close conn ch))
-    ;; Convert buffers to strings
+    ;; Convert command output bytes to UTF-8 strings for this text convenience API.
     (values
-     (map 'string #'code-char (channel-stdout-buffer ch))
-     (map 'string #'code-char (channel-stderr-buffer ch))
+     (%octets-to-string (channel-stdout-buffer ch))
+     (%octets-to-string (channel-stderr-buffer ch))
      (or (channel-exit-status ch) 0))))
 
 ;;;; Interactive shell
