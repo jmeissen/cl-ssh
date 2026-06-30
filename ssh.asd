@@ -23,6 +23,7 @@
                (:file "tests/test-kex-dh")
                (:file "tests/test-known-hosts")
                (:file "tests/test-config")
+               (:file "tests/test-ssh")
                (:file "tests/test-transport")
                (:file "tests/test-auth")
                (:file "tests/test-session")

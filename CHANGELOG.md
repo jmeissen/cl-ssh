@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- Honor `RekeyLimit` configuration and expose `ssh:connect`
+  `:rekey-byte-limit` / `:rekey-seconds-limit` overrides.
+- Support transport key re-exchange after the initial key exchange (RFC 4253 §9),
+  including packet, byte, and time based rekey triggers (RFC 4344 §3).
 - Support RFC 4256 `keyboard-interactive` authentication method. Fully supported,
   except there's no inbuilt masking of user input (RFC 4256 §3.3 ¶6).
 - Support for RFC 8308 `ext-info` discovery and `server-sig-algs`-based RSA public

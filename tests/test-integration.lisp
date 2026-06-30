@@ -93,6 +93,29 @@
 (defun trim-output (string)
   (string-trim '(#\Space #\Tab #\Newline #\Return) string))
 
+(defun client-transport (client)
+  (ssh::client-transport client))
+
+(defun reset-rekey-baseline (transport)
+  (let ((packet-stream (ssh/transport:transport-packet-stream transport)))
+    (setf (ssh/transport::transport-last-rekey-packets-out transport)
+          (ssh/packet:packet-stream-packets-out packet-stream)
+          (ssh/transport::transport-last-rekey-packets-in transport)
+          (ssh/packet:packet-stream-packets-in packet-stream)
+          (ssh/transport::transport-last-rekey-bytes-out transport)
+          (ssh/packet:packet-stream-bytes-out packet-stream)
+          (ssh/transport::transport-last-rekey-bytes-in transport)
+          (ssh/packet:packet-stream-bytes-in packet-stream)
+          (ssh/transport::transport-last-rekey-time transport)
+          (get-universal-time))))
+
+(defun assert-live-command (client command expected-output)
+  (multiple-value-bind (stdout stderr exit-code)
+      (run-command client command)
+    (is string= expected-output stdout)
+    (is string= "" stderr)
+    (is = 0 exit-code)))
+
 (defun rsa-live-test (port expected-algorithm)
   (if port
       (let ((target (integration-target port)))
@@ -277,6 +300,46 @@
       (is string= "out" stdout)
       (is string= "err" stderr)
       (is = 7 exit-code))))
+
+(define-test rekey-after-time-limit-keeps-session-usable
+  :parent (:ssh/integration-tests ssh/integration-tests)
+  (with-live-client (client :identity (fixture-path "id_ed25519_nopass"))
+    (let* ((transport (client-transport client))
+           (session-id (copy-seq (ssh/transport:transport-session-id transport)))
+           (old-rekey-time (- (get-universal-time) 2)))
+      (reset-rekey-baseline transport)
+      (setf (ssh/transport::transport-rekey-packet-limit transport) nil
+            (ssh/transport::transport-rekey-byte-limit transport) nil
+            (ssh/transport::transport-rekey-seconds-limit transport) 1
+            (ssh/transport::transport-last-rekey-time transport) old-rekey-time)
+      (assert-live-command client "printf time-rekey-ok" "time-rekey-ok")
+      (true (> (ssh/transport::transport-last-rekey-time transport)
+               old-rekey-time))
+      (is equalp session-id (ssh/transport:transport-session-id transport))
+      (setf (ssh/transport::transport-rekey-seconds-limit transport) nil)
+      (assert-live-command client "printf after-time-rekey" "after-time-rekey"))))
+
+(define-test rekey-after-data-limit-keeps-session-usable
+  :parent (:ssh/integration-tests ssh/integration-tests)
+  (with-live-client (client :identity (fixture-path "id_ed25519_nopass"))
+    (let* ((transport (client-transport client))
+           (session-id (copy-seq (ssh/transport:transport-session-id transport))))
+      (reset-rekey-baseline transport)
+      (let ((old-rekey-bytes-in
+              (ssh/transport::transport-last-rekey-bytes-in transport)))
+        (setf (ssh/transport::transport-rekey-packet-limit transport) nil
+              (ssh/transport::transport-rekey-byte-limit transport) 4096
+              (ssh/transport::transport-rekey-seconds-limit transport) nil)
+        (multiple-value-bind (stdout stderr exit-code)
+            (run-command client "yes rekey-data | head -c 8192")
+          (is = 8192 (length stdout))
+          (is string= "" stderr)
+          (is = 0 exit-code))
+        (true (> (ssh/transport::transport-last-rekey-bytes-in transport)
+                 old-rekey-bytes-in))
+        (is equalp session-id (ssh/transport:transport-session-id transport))
+        (setf (ssh/transport::transport-rekey-byte-limit transport) nil)
+        (assert-live-command client "printf after-data-rekey" "after-data-rekey")))))
 
 (define-test shell-helpers-work-over-live-connection
   :parent (:ssh/integration-tests ssh/integration-tests)

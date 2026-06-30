@@ -33,7 +33,9 @@
                 #:ssh-config-user
                 #:ssh-config-identity-files
                 #:ssh-config-strict-host-checking
-                #:ssh-config-known-hosts-file)
+                #:ssh-config-known-hosts-file
+                #:ssh-config-rekey-byte-limit
+                #:ssh-config-rekey-seconds-limit)
   (:import-from #:ssh/transport
                 #:connect-transport
                 #:transport-disconnect
@@ -110,6 +112,11 @@
 
 (in-package #:ssh/ssh)
 
+(defun effective-rekey-limit (explicit-value config-value)
+  (if (eq explicit-value :unset)
+      config-value
+      explicit-value))
+
 (defstruct (client (:constructor %make-client))
   "Opaque handle returned by CONNECT and accepted by all other functions."
   transport)
@@ -123,32 +130,31 @@
                   keyboard-interactive-callback
                   keyboard-interactive-submethods
                   known-hosts-path
-                  (strict-host-checking :unset))
-  "Connect to HOST and authenticate, transparently honouring ~/.ssh/config.
+                  (strict-host-checking :unset)
+                  (rekey-byte-limit :unset)
+                  (rekey-seconds-limit :unset))
+  "Connect to HOST and authenticate, transparently honoring ~/.ssh/config.
 
-   HOST may be a bare hostname/IP or a Host alias defined in ~/.ssh/config.
-   When HOST matches an alias, settings from the config file are used as
-   defaults; any keyword argument supplied here takes precedence.
+HOST may be a hostname, IP address, or Host alias from ~/.ssh/config.
+PORT is the TCP port number and falls back to Port or 22.
+USERNAME is the remote login name and falls back to User or the local user.
+PASSWORD enables password authentication when supplied.
+IDENTITY is a private-key pathname and falls back to the first IdentityFile.
+PASSPHRASE is the string used to decrypt an encrypted private key.
 
-   USERNAME    — remote login name.  Falls back to the config User field,
-                 then to the current OS user.
-   PASSWORD    — use password authentication.
-   IDENTITY    — path to a private key file; use public-key authentication.
-                 Falls back to the first IdentityFile in the config.
-   PASSPHRASE  — passphrase string for a passphrase-protected private key.
-                  Supply this together with IDENTITY when the key is encrypted.
-                  When omitted and the key is encrypted, KEY-NEEDS-PASSPHRASE
-                  is signalled with a SUPPLY-PASSPHRASE restart available.
-   KEYBOARD-INTERACTIVE-CALLBACK — callback function used by
-                  keyboard-interactive authentication.
-   KEYBOARD-INTERACTIVE-SUBMETHODS — NIL, comma-separated string, or list
-                  of submethod strings for keyboard-interactive.
-   KNOWN-HOSTS-PATH      — override the default ~/.ssh/known_hosts path.
-   STRICT-HOST-CHECKING  — T to refuse changed host keys (the default),
-                           NIL to accept them with a warning.
-                           Falls back to StrictHostKeyChecking in the config.
+KEYBOARD-INTERACTIVE-CALLBACK handles RFC 4256 prompts.
+KEYBOARD-INTERACTIVE-SUBMETHODS is NIL, a comma-separated string, or a list of
+ submethod strings.
 
-   Returns a CLIENT handle."
+KNOWN-HOSTS-PATH overrides UserKnownHostsFile or the default known_hosts path.
+STRICT-HOST-CHECKING is T to reject changed host keys or NIL to accept and update
+ them.
+REKEY-BYTE-LIMIT is a positive integer byte count, NIL to disable the byte limit,
+ :DEFAULT for the library default, or :UNSET to use RekeyLimit/defaults.
+REKEY-SECONDS-LIMIT is a positive integer second count, NIL to disable the time
+ limit, :DEFAULT for the library default, or :UNSET to use RekeyLimit/defaults.
+
+Returns a CLIENT handle."
   ;; Resolve ~/.ssh/config settings for this host alias
   (let* ((cfg (resolve-host host))
          (effective-host (or (ssh-config-hostname cfg) host))
@@ -164,18 +170,26 @@
                  (:accept-new nil)
                  (otherwise t))
                strict-host-checking))
+         (effective-rekey-byte-limit
+           (effective-rekey-limit rekey-byte-limit
+                                  (ssh-config-rekey-byte-limit cfg)))
+         (effective-rekey-seconds-limit
+           (effective-rekey-limit rekey-seconds-limit
+                                  (ssh-config-rekey-seconds-limit cfg)))
          (transport (connect-transport effective-host
                                        :port effective-port
                                        :known-hosts-path effective-khp
-                                       :strict-host-checking effective-strict)))
+                                       :strict-host-checking effective-strict
+                                       :rekey-byte-limit effective-rekey-byte-limit
+                                       :rekey-seconds-limit effective-rekey-seconds-limit)))
     (handler-case
         (progn
           (authenticate transport effective-user
-                         :password password
-                         :identity (when effective-id (pathname effective-id))
-                         :passphrase passphrase
-                         :keyboard-interactive-callback keyboard-interactive-callback
-                         :keyboard-interactive-submethods keyboard-interactive-submethods)
+                        :password password
+                        :identity (when effective-id (pathname effective-id))
+                        :passphrase passphrase
+                        :keyboard-interactive-callback keyboard-interactive-callback
+                        :keyboard-interactive-submethods keyboard-interactive-submethods)
           (%make-client :transport transport))
       (error (e)
         (ignore-errors (transport-disconnect transport))

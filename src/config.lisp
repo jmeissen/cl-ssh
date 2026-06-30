@@ -8,6 +8,7 @@
 ;;;;   Port                  UserKnownHostsFile
 ;;;;   User
 ;;;;   IdentityFile          (multiple allowed, accumulated in order)
+;;;;   RekeyLimit
 ;;;;
 ;;;; Unsupported keywords are silently ignored.
 ;;;;
@@ -25,7 +26,9 @@
    #:ssh-config-user
    #:ssh-config-identity-files
    #:ssh-config-strict-host-checking
-   #:ssh-config-known-hosts-file))
+   #:ssh-config-known-hosts-file
+   #:ssh-config-rekey-byte-limit
+   #:ssh-config-rekey-seconds-limit))
 
 (in-package :ssh/config)
 
@@ -38,7 +41,9 @@
   (user                 nil)      ; string or NIL
   (identity-files       '())      ; list of strings (pathnames), in config order
   (strict-host-checking :default) ; :yes :no :accept-new :default
-  (known-hosts-file     nil))     ; string or NIL
+  (known-hosts-file     nil)      ; string or NIL
+  (rekey-byte-limit     :unset)   ; integer, NIL, :DEFAULT, or :UNSET
+  (rekey-seconds-limit  :unset))  ; integer, NIL, or :UNSET
 
 ;;;; Helpers
 
@@ -64,7 +69,65 @@
                                s :start start)
         for tok = (subseq s start (or end len))
         unless (zerop (length tok)) collect tok
-        while end))
+          while end))
+
+(defun parse-size-value (value)
+  "Parse a size token into bytes.
+Returns (values limit validp)."
+  (cond
+    ((string-equal value "none") (values nil t))
+    ((string-equal value "default") (values :default t))
+    (t
+     (let* ((length (length value))
+            (last-index (and (plusp length) (1- length)))
+            (last-char (and last-index (char value last-index)))
+            (multiplier (cond ((member last-char '(#\k #\K)) 1024)
+                              ((member last-char '(#\m #\M)) (* 1024 1024))
+                              ((member last-char '(#\g #\G)) (* 1024 1024 1024))
+                              (t 1)))
+            (digits (if (= multiplier 1)
+                        value
+                        (subseq value 0 last-index)))
+            (number (ignore-errors (parse-integer digits :junk-allowed nil))))
+       (if (and number (plusp number))
+           (values (* number multiplier) t)
+           (values nil nil))))))
+
+(defun parse-time-value (value)
+  "Parse a time token into seconds.
+Returns (values limit validp)."
+  (cond
+    ((string-equal value "none") (values nil t))
+    (t
+     (let* ((length (length value))
+            (last-index (and (plusp length) (1- length)))
+            (last-char (and last-index (char value last-index)))
+            (suffix-p (member last-char '(#\s #\S #\m #\M #\h #\H #\d #\D #\w #\W)))
+            (multiplier (cond ((member last-char '(#\s #\S)) 1)
+                              ((member last-char '(#\m #\M)) 60)
+                              ((member last-char '(#\h #\H)) (* 60 60))
+                              ((member last-char '(#\d #\D)) (* 24 60 60))
+                              ((member last-char '(#\w #\W)) (* 7 24 60 60))
+                              (t 1)))
+            (digits (if suffix-p (subseq value 0 last-index) value))
+            (number (ignore-errors (parse-integer digits :junk-allowed nil))))
+       (if (and number (plusp number))
+           (values (* number multiplier) t)
+           (values nil nil))))))
+
+(defun parse-rekey-limit (value)
+  "Parse a RekeyLimit value into byte and second limits."
+  (let ((parts (split-whitespace value)))
+    (when (and parts (null (cddr parts)))
+      (multiple-value-bind (byte-limit byte-valid-p)
+          (parse-size-value (first parts))
+        (when byte-valid-p
+          (if (second parts)
+              (multiple-value-bind (seconds-limit seconds-valid-p)
+                  (parse-time-value (second parts))
+                (when seconds-valid-p
+                  (values byte-limit seconds-limit t)))
+              (values byte-limit nil t)))))))
 
 ;;;; Glob matching
 
@@ -184,7 +247,15 @@
 
     ((string= key "USERKNOWNHOSTSFILE")
      (unless (ssh-config-known-hosts-file cfg)
-       (setf (ssh-config-known-hosts-file cfg) (expand-tilde value))))))
+       (setf (ssh-config-known-hosts-file cfg) (expand-tilde value))))
+
+    ((string= key "REKEYLIMIT")
+     (when (eq (ssh-config-rekey-byte-limit cfg) :unset)
+       (multiple-value-bind (byte-limit seconds-limit valid-p)
+           (parse-rekey-limit value)
+         (when valid-p
+           (setf (ssh-config-rekey-byte-limit cfg) byte-limit)
+           (setf (ssh-config-rekey-seconds-limit cfg) seconds-limit)))))))
 
 ;;;; Public entry point
 

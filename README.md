@@ -224,7 +224,7 @@ If a server returns partial success, `ssh:auth-partial-success` is signaled. Han
 The following keywords are read and applied:
 
 `HostName`, `Port`, `User`, `IdentityFile`, `StrictHostKeyChecking`,
-`UserKnownHostsFile`
+`UserKnownHostsFile`, `RekeyLimit`
 
 All other keywords are silently ignored. `IdentitiesOnly` is not supported:
 even when set in the config, password authentication may still be attempted if
@@ -232,7 +232,6 @@ even when set in the config, password authentication may still be attempted if
 
 ## Known limitations
 
-- No re-key (subsequent key exchanges after the initial one)
 - No port forwarding
 - No SFTP protocol (subsystem channel can be opened; framing not implemented)
 - No `ssh-agent` support
@@ -251,11 +250,11 @@ the RFC to claim full compliance.
 | RFC 4250            | Partial                                           | Constants and algorithm names are defined for the supported subset only.                                                                                                              |
 | RFC 4251            | Partial                                           | SSH binary data types are implemented, but this is not full architecture compliance.                                                                                                  |
 | RFC 4252            | Partial                                           | Supports `none`, `password`, `publickey`, restartable partial-success continuation, and callback-driven `keyboard-interactive`; `hostbased` and password-change remain unimplemented. |
-| RFC 4253            | Partial                                           | Transport, KEXINIT, NEWKEYS, packet framing, and key derivation exist; no rekey and limited algorithms.                                                                               |
+| RFC 4253            | Partial                                           | Transport, KEXINIT, NEWKEYS, packet framing, key derivation, and rekey exist; limited algorithms.                                                                                     |
 | RFC 4254            | Partial                                           | Basic session channel, exec, shell, subsystem, and flow-control handling exist; port forwarding and server mode do not.                                                               |
 | RFC 4255            | None, probably too niche as well                  | DNS SSHFP lookup and validation are not implemented.                                                                                                                                  |
 | RFC 4256            | Yes, except                                       | no-echo input handling remains application-defined (§3.3 ¶6).                                                                                                                         |
-| RFC 4344            | Partial                                           | `aes128-ctr` and `aes256-ctr` are supported; rekey recommendations are not implemented.                                                                                               |
+| RFC 4344            | Partial                                           | `aes128-ctr`, `aes256-ctr` and rekey limits are implemented; `aes192-ctr` and the other CTR ciphers are absent.                                                                       |
 | RFC 4419 / RFC 8270 | None, but mostly deprecated                       | Diffie-Hellman group exchange is not implemented.                                                                                                                                     |
 | RFC 5647            | None. Should do the OpenSSH one when implementing | AES-GCM is not implemented.                                                                                                                                                           |
 | RFC 5656            | None, but should be implemented                   | NIST ECDH, ECDSA, and ECMQV are not implemented; Curve25519 only reuses ECDH packet framing.                                                                                          |

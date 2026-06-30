@@ -14,7 +14,9 @@
     #:ssh-config-user
     #:ssh-config-identity-files
     #:ssh-config-strict-host-checking
-    #:ssh-config-known-hosts-file))
+    #:ssh-config-known-hosts-file
+    #:ssh-config-rekey-byte-limit
+    #:ssh-config-rekey-seconds-limit))
 
 (in-package :ssh/tests/config)
 
@@ -294,6 +296,74 @@ Host myserver
       (is = 9999 (ssh-config-port cfg))
       (is string= "bob" (ssh-config-user cfg)))))
 
+;;; ---- resolve-host: RekeyLimit -----------------------------------------
+
+(define-test rekey-limit-parses-byte-units
+  :parent (:ssh/tests ssh/tests)
+  (with-config "Host myserver
+    RekeyLimit 64K
+"
+    (let ((cfg (funcall resolve "myserver")))
+      (is = 65536 (ssh-config-rekey-byte-limit cfg))
+      (is eq nil (ssh-config-rekey-seconds-limit cfg)))))
+
+(define-test rekey-limit-parses-byte-and-time-units
+  :parent (:ssh/tests ssh/tests)
+  (with-config "Host myserver
+    RekeyLimit 512M 2h
+"
+    (let ((cfg (funcall resolve "myserver")))
+      (is = (* 512 1024 1024) (ssh-config-rekey-byte-limit cfg))
+      (is = 7200 (ssh-config-rekey-seconds-limit cfg)))))
+
+(define-test rekey-limit-none-disables-time-limit
+  :parent (:ssh/tests ssh/tests)
+  (with-config "Host myserver
+    RekeyLimit 1G none
+"
+    (let ((cfg (funcall resolve "myserver")))
+      (is = (* 1024 1024 1024) (ssh-config-rekey-byte-limit cfg))
+      (is eq nil (ssh-config-rekey-seconds-limit cfg)))))
+
+(define-test rekey-limit-none-disables-byte-and-time-limit
+  :parent (:ssh/tests ssh/tests)
+  (with-config "Host myserver
+    RekeyLimit none
+"
+    (let ((cfg (funcall resolve "myserver")))
+      (is eq nil (ssh-config-rekey-byte-limit cfg))
+      (is eq nil (ssh-config-rekey-seconds-limit cfg)))))
+
+(define-test rekey-limit-default-keeps-library-byte-default
+  :parent (:ssh/tests ssh/tests)
+  (with-config "Host myserver
+    RekeyLimit default 30m
+"
+    (let ((cfg (funcall resolve "myserver")))
+      (is eq :default (ssh-config-rekey-byte-limit cfg))
+      (is = 1800 (ssh-config-rekey-seconds-limit cfg)))))
+
+(define-test rekey-limit-first-match-wins
+  :parent (:ssh/tests ssh/tests)
+  (with-config "Host web*
+    RekeyLimit 32K 10s
+
+Host web-prod
+    RekeyLimit 1G 1h
+"
+    (let ((cfg (funcall resolve "web-prod")))
+      (is = 32768 (ssh-config-rekey-byte-limit cfg))
+      (is = 10 (ssh-config-rekey-seconds-limit cfg)))))
+
+(define-test rekey-limit-invalid-value-is-ignored
+  :parent (:ssh/tests ssh/tests)
+  (with-config "Host myserver
+    RekeyLimit nonsense
+"
+    (let ((cfg (funcall resolve "myserver")))
+      (is eq :unset (ssh-config-rekey-byte-limit cfg))
+      (is eq :unset (ssh-config-rekey-seconds-limit cfg)))))
+
 ;;; ---- resolve-host: missing file ----------------------------------------
 
 (define-test missing-config-file-returns-empty
@@ -303,4 +373,6 @@ Host myserver
     (is eq nil (ssh-config-hostname cfg))
     (is eq nil (ssh-config-port cfg))
     (is eq nil (ssh-config-user cfg))
-    (is eq :default (ssh-config-strict-host-checking cfg))))
+    (is eq :default (ssh-config-strict-host-checking cfg))
+    (is eq :unset (ssh-config-rekey-byte-limit cfg))
+    (is eq :unset (ssh-config-rekey-seconds-limit cfg))))

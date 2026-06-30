@@ -80,6 +80,21 @@
     (recv-packet ps)
     (is = 2 (ssh/packet:packet-stream-seq-in  ps))))
 
+(define-test packet-stream-tracks-rekey-counters
+  :parent (:ssh/tests ssh/tests)
+  (let* ((pipe (make-pipe))
+         (ps   (make-packet-stream pipe)))
+    (is = 0 (ssh/packet:packet-stream-packets-out ps))
+    (is = 0 (ssh/packet:packet-stream-packets-in ps))
+    (is = 0 (ssh/packet:packet-stream-bytes-out ps))
+    (is = 0 (ssh/packet:packet-stream-bytes-in ps))
+    (send-packet ps (octets 2 3 4))
+    (is = 1 (ssh/packet:packet-stream-packets-out ps))
+    (true (plusp (ssh/packet:packet-stream-bytes-out ps)))
+    (recv-packet ps)
+    (is = 1 (ssh/packet:packet-stream-packets-in ps))
+    (true (plusp (ssh/packet:packet-stream-bytes-in ps)))))
+
 (define-test cleartext-multiple-packets
   :parent (:ssh/tests ssh/tests)
   (let* ((pipe (make-pipe))

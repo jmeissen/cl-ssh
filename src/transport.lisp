@@ -40,7 +40,9 @@
                 #:read-remaining-bytes #:read-name-list)
   (:import-from #:ssh/packet
                 #:make-packet-stream #:send-packet #:recv-packet #:install-keys
-                #:make-hmac-mac-fn #:ssh-protocol-error)
+                #:make-hmac-mac-fn #:ssh-protocol-error
+                #:packet-stream-packets-out #:packet-stream-packets-in
+                #:packet-stream-bytes-out #:packet-stream-bytes-in)
   (:import-from #:ssh/algorithms
                  #:kexinit-payload #:parse-kexinit #:kexinit-kex-algorithms
                  #:negotiate-algorithms
@@ -80,11 +82,54 @@
 
 ;;;; Transport structure
 
+(defconstant +default-rekey-packet-limit+ #.(ash 1 28)
+  "Default maximum packets sent or received with one set of keys.")
+
+(defconstant +default-rekey-byte-limit+ #.(ash 1 30)
+  "Default maximum bytes sent or received with one set of keys.")
+
+(defconstant +default-rekey-seconds-limit+ 3600
+  "Default maximum seconds to keep one set of keys.")
+
+(defconstant +default-rekey-pending-packet-limit+ 1024
+  "Default maximum non-KEX packets buffered while waiting for peer KEXINIT.")
+
+(defconstant +default-rekey-pending-byte-limit+ #.(ash 1 26)
+  "Default maximum non-KEX packet payload bytes buffered while waiting for peer KEXINIT.")
+
+(defun normalize-rekey-limit (value default)
+  (cond
+    ((or (eq value :unset) (eq value :default)) default)
+    ((or (null value)
+         (and (integerp value) (plusp value)))
+     value)
+    (t
+     (error 'transport-error
+            :message (format nil "invalid rekey limit: ~S" value)))))
+
 (defstruct transport
   packet-stream
   session-id
   server-sig-algs
   hostname
+  client-version
+  server-version
+  known-hosts-path
+  (strict-host-checking t)
+  pending-packets
+  (pending-packet-count 0 :type (integer 0 *))
+  (pending-packet-bytes 0 :type (integer 0 *))
+  (rekeying-p nil :type boolean)
+  (last-rekey-packets-out 0 :type (integer 0 *))
+  (last-rekey-packets-in 0 :type (integer 0 *))
+  (last-rekey-bytes-out 0 :type (integer 0 *))
+  (last-rekey-bytes-in 0 :type (integer 0 *))
+  (last-rekey-time 0 :type (integer 0 *))
+  (rekey-packet-limit +default-rekey-packet-limit+)
+  (rekey-byte-limit +default-rekey-byte-limit+)
+  (rekey-seconds-limit +default-rekey-seconds-limit+)
+  (rekey-pending-packet-limit +default-rekey-pending-packet-limit+)
+  (rekey-pending-byte-limit +default-rekey-pending-byte-limit+)
   ;; The raw socket (kept for cleanup)
   socket)
 
@@ -252,25 +297,245 @@
     (error 'transport-error
            :message "server sent ext-info-c in KEXINIT")))
 
+;;;; Key exchange / rekey helpers
+
+(defun payload-message-type (payload)
+  (when (plusp (length payload))
+    (aref payload 0)))
+
+(defun enqueue-pending-packet (transport packet)
+  (let ((new-count (1+ (transport-pending-packet-count transport)))
+        (new-bytes (+ (transport-pending-packet-bytes transport)
+                      (length packet))))
+    (when (or (> new-count (transport-rekey-pending-packet-limit transport))
+              (> new-bytes (transport-rekey-pending-byte-limit transport)))
+      (error 'transport-error
+             :message "too many in-flight packets before rekey KEXINIT"))
+    (setf (transport-pending-packets transport)
+          (nconc (transport-pending-packets transport) (list packet))
+          (transport-pending-packet-count transport) new-count
+          (transport-pending-packet-bytes transport) new-bytes)))
+
+(defun dequeue-pending-packet (transport)
+  (let ((pending (transport-pending-packets transport)))
+    (when pending
+      (setf (transport-pending-packets transport) (rest pending))
+      (decf (transport-pending-packet-count transport))
+      (decf (transport-pending-packet-bytes transport) (length (first pending)))
+      (first pending))))
+
+(defun rekey-limit-reached-p (current baseline limit)
+  (and limit
+       (plusp limit)
+       (>= (- current baseline) limit)))
+
+(defun transport-rekey-needed-p (transport &key (now (get-universal-time)))
+  (let ((ps (transport-packet-stream transport)))
+    (and (transport-session-id transport)
+         (not (transport-rekeying-p transport))
+         (or (rekey-limit-reached-p (packet-stream-packets-out ps)
+                                    (transport-last-rekey-packets-out transport)
+                                    (transport-rekey-packet-limit transport))
+             (rekey-limit-reached-p (packet-stream-packets-in ps)
+                                    (transport-last-rekey-packets-in transport)
+                                    (transport-rekey-packet-limit transport))
+             (rekey-limit-reached-p (packet-stream-bytes-out ps)
+                                    (transport-last-rekey-bytes-out transport)
+                                    (transport-rekey-byte-limit transport))
+             (rekey-limit-reached-p (packet-stream-bytes-in ps)
+                                    (transport-last-rekey-bytes-in transport)
+                                    (transport-rekey-byte-limit transport))
+             (rekey-limit-reached-p now
+                                    (transport-last-rekey-time transport)
+                                    (transport-rekey-seconds-limit transport))))))
+
+(defun note-key-exchange-complete (transport &key (now (get-universal-time)))
+  (let ((ps (transport-packet-stream transport)))
+    (setf (transport-last-rekey-packets-out transport) (packet-stream-packets-out ps)
+          (transport-last-rekey-packets-in transport)  (packet-stream-packets-in ps)
+          (transport-last-rekey-bytes-out transport)   (packet-stream-bytes-out ps)
+          (transport-last-rekey-bytes-in transport)    (packet-stream-bytes-in ps)
+          (transport-last-rekey-time transport)        now
+          (transport-rekeying-p transport)             nil)))
+
+(defun make-kex-host-key-verifier (transport host-key-algorithm)
+  (lambda (host-key-blob exchange-hash sig-blob)
+    (verify-host-key-signature
+     host-key-algorithm host-key-blob exchange-hash sig-blob)
+    (apply #'check-host-key
+           (transport-hostname transport)
+           host-key-algorithm
+           host-key-blob
+           (append
+            (when (transport-known-hosts-path transport)
+              (list :known-hosts-path (transport-known-hosts-path transport)))
+            (list :strict (transport-strict-host-checking transport))))))
+
+(defun send-newkeys (packet-stream)
+  (let ((newkeys-buf (make-write-buffer)))
+    (write-byte* newkeys-buf +msg-newkeys+)
+    (send-packet packet-stream (buffer-to-octets newkeys-buf))))
+
+(defun prefix-octets (octets length)
+  (if (= (length octets) length)
+      octets
+      (subseq octets 0 length)))
+
+(defun install-kex-result-keys (packet-stream kex-result negotiated direction)
+  (ecase direction
+    (:out
+     (let* ((cipher-name (negotiated-cipher-c2s negotiated))
+            (mac-name    (negotiated-mac-c2s negotiated))
+            (iv          (prefix-octets (kex-result-iv-c2s kex-result)
+                                        (cipher-block-size cipher-name)))
+            (key         (prefix-octets (kex-result-key-c2s kex-result)
+                                        (cipher-key-length cipher-name)))
+            (mac-key     (prefix-octets (kex-result-mac-c2s kex-result)
+                                        (mac-key-length mac-name))))
+       (install-keys packet-stream
+         :cipher-out     (make-aes-ctr-cipher key iv)
+         :block-size-out (cipher-block-size cipher-name)
+         :mac-out        (make-hmac-mac-fn mac-key (mac-digest-name mac-name))
+         :mac-length-out (mac-output-length mac-name))))
+    (:in
+     (let* ((cipher-name (negotiated-cipher-s2c negotiated))
+            (mac-name    (negotiated-mac-s2c negotiated))
+            (iv          (prefix-octets (kex-result-iv-s2c kex-result)
+                                        (cipher-block-size cipher-name)))
+            (key         (prefix-octets (kex-result-key-s2c kex-result)
+                                        (cipher-key-length cipher-name)))
+            (mac-key     (prefix-octets (kex-result-mac-s2c kex-result)
+                                        (mac-key-length mac-name))))
+       (install-keys packet-stream
+         :cipher-in      (make-aes-ctr-cipher key iv)
+         :block-size-in  (cipher-block-size cipher-name)
+         :mac-in         (make-hmac-mac-fn mac-key (mac-digest-name mac-name))
+         :mac-length-in  (mac-output-length mac-name))))))
+
+(defun perform-negotiated-key-exchange (transport client-kexinit-payload server-kexinit-payload)
+  (unless (= (or (payload-message-type server-kexinit-payload) -1) +msg-kexinit+)
+    (error 'transport-error
+           :message (format nil "expected KEXINIT (20), got ~D"
+                            (or (payload-message-type server-kexinit-payload) -1))))
+  (let* ((packet-stream (transport-packet-stream transport))
+         (server-kexinit (parse-kexinit server-kexinit-payload)))
+    (validate-server-kexinit server-kexinit)
+    (let* ((neg (negotiate-algorithms server-kexinit))
+           (kex-algo      (negotiated-kex neg))
+           (host-key-algo (negotiated-host-key neg))
+           (cipher-c2s    (negotiated-cipher-c2s neg))
+           (cipher-s2c    (negotiated-cipher-s2c neg))
+           (mac-c2s-name  (negotiated-mac-c2s neg))
+           (mac-s2c-name  (negotiated-mac-s2c neg))
+           (key-verifier  (make-kex-host-key-verifier transport host-key-algo))
+           (kex-args (list packet-stream
+                           (transport-client-version transport)
+                           (transport-server-version transport)
+                           client-kexinit-payload
+                           server-kexinit-payload
+                           (transport-session-id transport)
+                           key-verifier
+                           :iv-length (max (cipher-block-size cipher-c2s)
+                                           (cipher-block-size cipher-s2c))
+                           :cipher-key-length (max (cipher-key-length cipher-c2s)
+                                                   (cipher-key-length cipher-s2c))
+                           :mac-key-length (max (mac-key-length mac-c2s-name)
+                                                (mac-key-length mac-s2c-name)))))
+      (let ((kex-result
+              (cond
+                ((or (string= kex-algo "curve25519-sha256")
+                     (string= kex-algo "curve25519-sha256@libssh.org"))
+                 (apply #'perform-kex-curve25519 kex-args))
+                ((string= kex-algo "diffie-hellman-group14-sha256")
+                 (apply #'perform-kex-dh-group14 kex-args))
+                (t
+                 (error 'transport-error
+                        :message (format nil "negotiated unsupported KEX: ~S"
+                                         kex-algo))))))
+        (send-newkeys packet-stream)
+        (install-kex-result-keys packet-stream kex-result neg :out)
+        (let ((newkeys-pkt (recv-packet packet-stream)))
+          (unless (= (or (payload-message-type newkeys-pkt) -1) +msg-newkeys+)
+            (error 'transport-error
+                   :message (format nil "expected NEWKEYS (21), got ~D"
+                                    (or (payload-message-type newkeys-pkt) -1)))))
+        (install-kex-result-keys packet-stream kex-result neg :in)
+        (setf (transport-session-id transport)
+              (kex-result-session-id kex-result))
+        (note-key-exchange-complete transport)
+        kex-result))))
+
+(defun receive-server-kexinit-for-rekey (transport)
+  (let ((packet-stream (transport-packet-stream transport)))
+    (loop
+      for packet = (recv-packet packet-stream)
+      for type = (payload-message-type packet)
+      do (case type
+           (#.+msg-kexinit+ (return packet))
+           (#.+msg-ignore+ nil)
+           (#.+msg-debug+ nil)
+           (#.+msg-ext-info+ (process-ext-info transport packet))
+           (#.+msg-disconnect+
+            (error 'transport-error :message "server sent SSH_MSG_DISCONNECT"))
+           (otherwise
+            (enqueue-pending-packet transport packet))))))
+
+(defun perform-initial-key-exchange (transport)
+  (let* ((packet-stream (transport-packet-stream transport))
+         (client-kexinit (kexinit-payload :include-ext-info-c-p t)))
+    (send-packet packet-stream client-kexinit)
+    (perform-negotiated-key-exchange
+     transport
+     client-kexinit
+     (recv-packet packet-stream))))
+
+(defun transport-rekey (transport &key server-kexinit-payload)
+  (when (transport-rekeying-p transport)
+    (return-from transport-rekey nil))
+  (let* ((packet-stream (transport-packet-stream transport))
+         (client-kexinit (kexinit-payload :include-ext-info-c-p nil)))
+    (setf (transport-rekeying-p transport) t)
+    (unwind-protect
+         (let ((server-payload
+                 (if server-kexinit-payload
+                     (progn
+                       (send-packet packet-stream client-kexinit)
+                       server-kexinit-payload)
+                     (progn
+                       (send-packet packet-stream client-kexinit)
+                       (receive-server-kexinit-for-rekey transport)))))
+           (perform-negotiated-key-exchange transport client-kexinit server-payload))
+      (setf (transport-rekeying-p transport) nil))))
+
 ;;;; Main setup
 
 (defun connect-transport (hostname
-                           &key (port 22)
-                                (known-hosts-path nil)
-                                (strict-host-checking t))
+                          &key (port 22)
+                            (known-hosts-path nil)
+                            (strict-host-checking t)
+                            (rekey-byte-limit +default-rekey-byte-limit+)
+                            (rekey-seconds-limit +default-rekey-seconds-limit+))
   "Open a TCP connection to HOSTNAME:PORT, perform the full SSH transport
    handshake (version exchange, KEX, host-key verification, NEWKEYS, service
    request), and return a TRANSPORT struct ready for use by the auth layer.
 
    KNOWN-HOSTS-PATH  — pathname for the known_hosts file; NIL uses the default.
    STRICT-HOST-CHECKING — if true (default), refuse changed host keys."
-  (let* ((socket  (usocket:socket-connect hostname port
-                                           :element-type '(unsigned-byte 8)))
-          (stream  (usocket:socket-stream socket))
-          (ps      (make-packet-stream stream))
-          (transport (make-transport :packet-stream ps
-                                     :hostname hostname
-                                     :socket socket)))
+  (let* ((socket (usocket:socket-connect hostname port
+                                         :element-type '(unsigned-byte 8)))
+         (stream (usocket:socket-stream socket))
+         (ps (make-packet-stream stream))
+         (transport (make-transport :packet-stream ps
+                                    :hostname hostname
+                                    :known-hosts-path known-hosts-path
+                                    :strict-host-checking strict-host-checking
+                                    :rekey-byte-limit (normalize-rekey-limit
+                                                       rekey-byte-limit
+                                                       +default-rekey-byte-limit+)
+                                    :rekey-seconds-limit (normalize-rekey-limit
+                                                          rekey-seconds-limit
+                                                          +default-rekey-seconds-limit+)
+                                    :socket socket)))
 
     (handler-bind ((error (lambda (e)
                             (declare (ignore e))
@@ -278,109 +543,25 @@
 
       ;; 1. Version exchange
       (send-version stream)
-      (let* ((our-version    (map '(vector (unsigned-byte 8)) #'char-code +client-version-string+))
+      (let* ((our-version (map '(vector (unsigned-byte 8)) #'char-code +client-version-string+))
              (server-version (recv-version stream)))
+        (setf (transport-client-version transport) our-version
+              (transport-server-version transport) server-version)
 
-        ;; 2. Build and send our KEXINIT.
-        (let ((our-kexinit (kexinit-payload)))
-          (send-packet ps our-kexinit)
+        (perform-initial-key-exchange transport)
 
-          ;; 3. Receive server KEXINIT
-          (let ((server-kexinit-payload (recv-packet ps)))
-            (unless (= (aref server-kexinit-payload 0) +msg-kexinit+)
-              (error 'transport-error
-                     :message (format nil "expected KEXINIT (20), got ~D"
-                                      (aref server-kexinit-payload 0))))
-            (let* ((server-kexinit (parse-kexinit server-kexinit-payload)))
-              (validate-server-kexinit server-kexinit)
-              (let* (;; 4. Negotiate algorithms
-                   (neg (negotiate-algorithms server-kexinit))
-                    (kex-algo      (negotiated-kex neg))
-                    (host-key-algo (negotiated-host-key neg))
-                    (cipher-c2s   (negotiated-cipher-c2s neg))
-                    (cipher-s2c   (negotiated-cipher-s2c neg))
-                   (mac-c2s-name (negotiated-mac-c2s neg))
-                   (mac-s2c-name (negotiated-mac-s2c neg)))
+        ;; Request the userauth service.
+        (let ((svc-buf (make-write-buffer)))
+          (write-byte* svc-buf +msg-service-request+)
+          (write-string* svc-buf +service-userauth+)
+          (send-packet ps (buffer-to-octets svc-buf)))
 
-              ;; 5. Key exchange — dispatch on negotiated algorithm.
-              (let* ((key-verifier
-                      ;; Host-key verifier closure shared by all KEX paths.
-                      (lambda (host-key-blob exchange-hash sig-blob)
-                        ;; a) Verify cryptographic signature.
-                        (verify-host-key-signature
-                         host-key-algo host-key-blob exchange-hash sig-blob)
-                        ;; b) Check / update known_hosts.
-                        (apply #'check-host-key
-                               hostname host-key-algo host-key-blob
-                               (append
-                                (when known-hosts-path
-                                  (list :known-hosts-path known-hosts-path))
-                                (list :strict strict-host-checking)))))
-                     (kex-args (list ps
-                                     our-version
-                                     server-version
-                                     our-kexinit
-                                     server-kexinit-payload
-                                     nil          ; first exchange: no prior session-id
-                                     key-verifier
-                                     :iv-length         (cipher-block-size cipher-c2s)
-                                     :cipher-key-length (cipher-key-length cipher-c2s)
-                                     :mac-key-length    (mac-key-length mac-c2s-name))))
-              (let ((kex-result
-                     (cond
-                       ((or (string= kex-algo "curve25519-sha256")
-                            (string= kex-algo "curve25519-sha256@libssh.org"))
-                        (apply #'perform-kex-curve25519 kex-args))
-                       ((string= kex-algo "diffie-hellman-group14-sha256")
-                        (apply #'perform-kex-dh-group14 kex-args))
-                       (t
-                        (error 'transport-error
-                               :message (format nil "negotiated unsupported KEX: ~S"
-                                                kex-algo))))))
+        ;; Expect SSH_MSG_SERVICE_ACCEPT.
+        (let ((svc-reply (transport-recv-skipping-global
+                          transport +msg-service-accept+)))
+          (declare (ignore svc-reply)))
 
-                ;; 6. Send SSH_MSG_NEWKEYS
-                (let ((newkeys-buf (make-write-buffer)))
-                  (write-byte* newkeys-buf +msg-newkeys+)
-                  (send-packet ps (buffer-to-octets newkeys-buf)))
-
-                ;; 7. Receive SSH_MSG_NEWKEYS from server
-                (let ((newkeys-pkt (recv-packet ps)))
-                  (unless (= (aref newkeys-pkt 0) +msg-newkeys+)
-                    (error 'transport-error
-                           :message (format nil "expected NEWKEYS (21), got ~D"
-                                            (aref newkeys-pkt 0)))))
-
-                ;; 8. Install symmetric keys
-                (let* ((iv-c2s  (kex-result-iv-c2s  kex-result))
-                       (iv-s2c  (kex-result-iv-s2c  kex-result))
-                       (key-c2s (kex-result-key-c2s kex-result))
-                       (key-s2c (kex-result-key-s2c kex-result))
-                       (mac-c2s-key (kex-result-mac-c2s kex-result))
-                       (mac-s2c-key (kex-result-mac-s2c kex-result)))
-                  (install-keys ps
-                    :cipher-out     (make-aes-ctr-cipher key-c2s iv-c2s)
-                    :cipher-in      (make-aes-ctr-cipher key-s2c iv-s2c)
-                    :block-size-out (cipher-block-size cipher-c2s)
-                    :block-size-in  (cipher-block-size cipher-s2c)
-                    :mac-out        (make-hmac-mac-fn mac-c2s-key (mac-digest-name mac-c2s-name))
-                    :mac-in         (make-hmac-mac-fn mac-s2c-key (mac-digest-name mac-s2c-name))
-                    :mac-length-out (mac-output-length mac-c2s-name)
-                    :mac-length-in  (mac-output-length mac-s2c-name)))
-
-                ;; 9. Request the userauth service
-                (let ((svc-buf (make-write-buffer)))
-                  (write-byte*   svc-buf +msg-service-request+)
-                  (write-string* svc-buf +service-userauth+)
-                  (send-packet ps (buffer-to-octets svc-buf)))
-
-                ;; Expect SSH_MSG_SERVICE_ACCEPT
-                (let ((svc-reply (transport-recv-skipping-global
-                                   transport +msg-service-accept+)))
-                  (declare (ignore svc-reply)))
-
-                (setf (transport-session-id transport)
-                      (kex-result-session-id kex-result))
-                transport))))))))))
+        transport))))
 
 ;;;; Message dispatch helpers
 
@@ -389,12 +570,18 @@
    packet of EXPECTED-TYPE (or any non-global message) is found.
    Returns the payload."
   (let ((ps (transport-packet-stream transport)))
+    (when (and (null (transport-pending-packets transport))
+               (transport-rekey-needed-p transport))
+      (transport-rekey transport))
     (loop
-      for pkt = (recv-packet ps)
+      for pkt = (or (dequeue-pending-packet transport)
+                    (recv-packet ps))
       do (case (aref pkt 0)
            (#.+msg-ignore+ nil)   ; discard
            (#.+msg-debug+ nil)    ; discard (could log)
            (#.+msg-ext-info+ (process-ext-info transport pkt))
+           (#.+msg-kexinit+
+            (transport-rekey transport :server-kexinit-payload pkt))
            (#.+msg-disconnect+
             (error 'transport-error :message "server sent SSH_MSG_DISCONNECT"))
            (otherwise
@@ -408,6 +595,8 @@
 
 (defun transport-send (transport payload)
   "Send PAYLOAD as an encrypted SSH packet."
+  (when (transport-rekey-needed-p transport)
+    (transport-rekey transport))
   (send-packet (transport-packet-stream transport) payload))
 
 (defun transport-recv (transport)

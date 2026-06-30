@@ -21,6 +21,10 @@
    #:packet-stream-socket-stream
    #:packet-stream-seq-out
    #:packet-stream-seq-in
+   #:packet-stream-packets-out
+   #:packet-stream-packets-in
+   #:packet-stream-bytes-out
+   #:packet-stream-bytes-in
    #:send-packet
    #:recv-packet
    #:install-keys
@@ -43,6 +47,11 @@
   ;; Sequence numbers — uint32 wrapping (RFC 4253 §6.4)
   (seq-out 0 :type (unsigned-byte 32))
   (seq-in  0 :type (unsigned-byte 32))
+  ;; Monotonic counters used by transport rekey policy.
+  (packets-out 0 :type (integer 0 *))
+  (packets-in  0 :type (integer 0 *))
+  (bytes-out   0 :type (integer 0 *))
+  (bytes-in    0 :type (integer 0 *))
   ;; Active cipher objects (or NIL for "none")
   cipher-out
   cipher-in
@@ -130,8 +139,11 @@
       ;; Send ciphertext then MAC
       (%write-octets (packet-stream-socket-stream ps) plaintext)
       (when mac
-        (%write-octets (packet-stream-socket-stream ps) mac)))
+        (%write-octets (packet-stream-socket-stream ps) mac))
+      (incf (packet-stream-bytes-out ps)
+            (+ total (if mac (length mac) 0))))
     ;; Advance sequence number (wraps at 2^32)
+    (incf (packet-stream-packets-out ps))
     (setf (packet-stream-seq-out ps) (ldb (byte 32 0) (1+ seq)))
     seq))
 
@@ -155,6 +167,7 @@
          (cipher-in  (packet-stream-cipher-in ps))
          (bs         (max (packet-stream-block-size-in ps) 8))
          (seq        (packet-stream-seq-in ps))
+         (mac-len    (packet-stream-mac-length-in ps))
          ;; Step 1: read and decrypt the first block to learn packet_length
          (first-block (%read-octets stream bs)))
     (when cipher-in
@@ -181,18 +194,19 @@
             (ironclad:decrypt-in-place cipher-in rest))
           (replace plaintext rest :start1 bs)))
       ;; Step 3: read and verify MAC
-      (let ((mac-len (packet-stream-mac-length-in ps)))
-        (when (plusp mac-len)
-          (let ((received-mac (%read-octets stream mac-len))
-                (expected-mac (funcall (packet-stream-mac-in ps) seq plaintext)))
-            (unless (ironclad:constant-time-equal received-mac expected-mac)
-              (error 'ssh-protocol-error :message "MAC verification failed")))))
+      (when (plusp mac-len)
+        (let ((received-mac (%read-octets stream mac-len))
+              (expected-mac (funcall (packet-stream-mac-in ps) seq plaintext)))
+          (unless (ironclad:constant-time-equal received-mac expected-mac)
+            (error 'ssh-protocol-error :message "MAC verification failed"))))
       ;; Step 4: extract payload
       (let* ((padding-length (aref plaintext 4))
              (payload-length (- pkt-length 1 padding-length))
              (payload        (make-array payload-length :element-type '(unsigned-byte 8))))
         (replace payload plaintext :start2 5 :end2 (+ 5 payload-length))
         ;; Advance sequence number
+        (incf (packet-stream-packets-in ps))
+        (incf (packet-stream-bytes-in ps) (+ total mac-len))
         (setf (packet-stream-seq-in ps) (ldb (byte 32 0) (1+ seq)))
         payload))))
 
