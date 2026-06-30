@@ -132,6 +132,7 @@ Single command execution.
 (ssh:with-connection (client "my_host")
   (multiple-value-bind (stdout stderr exit-code)
       (ssh:run-command client "ls -la /tmp")
+    (declare (ignore stderr exit-code))
     (format t "~A" stdout)))
 ```
 
