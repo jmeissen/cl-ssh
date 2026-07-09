@@ -48,6 +48,16 @@
       (format f "~A ~A ~A~%" hostname key-type base64-key))
     path))
 
+(defun write-empty-known-hosts ()
+  (let ((path (merge-pathnames
+               (format nil "cl-ssh-test-~A.known_hosts" (gensym))
+               (uiop:temporary-directory))))
+    (with-open-file (f path :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create)
+      (write-string "" f))
+    path))
+
 (defun env-value (name)
   (uiop:getenv name))
 
@@ -205,6 +215,47 @@
   :parent (:ssh/integration-tests ssh/integration-tests)
   (with-live-client (client :identity (fixture-path "id_ed25519_nopass"))
     (true (transport-server-sig-algs (ssh::client-transport client)))))
+
+(define-test trust-on-first-use-records-live-host-key
+  :parent (:ssh/integration-tests ssh/integration-tests)
+  (let ((target (integration-target)))
+    (if target
+        (let ((known-hosts (write-empty-known-hosts)))
+          (unwind-protect
+               (let ((client (connect (integration-target-host target)
+                                      :port (integration-target-port target)
+                                      :username (integration-target-user target)
+                                      :known-hosts-path known-hosts
+                                      :identity (fixture-path "id_ed25519_nopass")
+                                      :strict-host-checking t)))
+                 (unwind-protect
+                      (progn
+                        (let* ((entries (ssh/known-hosts::load-known-hosts known-hosts))
+                               (entry (first entries)))
+                          (is = 1 (length entries))
+                          (true entry)
+                          (when entry
+                            (is string= (integration-target-host target)
+                                (ssh/known-hosts::known-hosts-entry-raw-hostname entry))
+                            (true (member (ssh/known-hosts::known-hosts-entry-key-type entry)
+                                          ssh/algorithms:+preferred-host-key+
+                                          :test #'string=))
+                            (true (plusp (length (ssh/known-hosts::known-hosts-entry-key-blob entry))))))
+                        (false (probe-file (ssh/known-hosts::known-hosts-lock-path known-hosts)))
+                        (let ((strict-client (connect (integration-target-host target)
+                                                      :port (integration-target-port target)
+                                                      :username (integration-target-user target)
+                                                      :known-hosts-path known-hosts
+                                                      :identity (fixture-path "id_ed25519_nopass")
+                                                      :strict-host-checking t)))
+                          (unwind-protect
+                               (true strict-client)
+                            (disconnect strict-client))))
+                   (ignore-errors (disconnect client))))
+            (ignore-errors (delete-file (ssh/known-hosts::known-hosts-lock-path known-hosts)))
+            (ignore-errors (delete-file known-hosts))))
+        (skip "requires SSH_TEST_HOST, SSH_TEST_PORT, SSH_TEST_USER, and SSH_TEST_KNOWN_HOSTS"
+          (true t)))))
 
 (define-test public-key-auth-works-with-rsa-sha2-512
   :parent (:ssh/integration-tests ssh/integration-tests)
