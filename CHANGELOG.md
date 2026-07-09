@@ -14,6 +14,9 @@
 - Integration tests through Docker and an additional integration testing system.
 
 ### Fixed
+- Plain `known_hosts` hostnames now match case-insensitively when checking the local
+  host name-to-key db because DNS is case-insensitive (RFC 1035 §2.3.3 ¶1)
+- `known_hosts` additions and stale-key replacement now use a lock.
 - Prefer the stronger `aes256-ctr` over `aes128-ctr` for kex and rekey.
 - Reuse packet HMAC state between packets (for performance).
 - SSH data encoding, octets, US-ASCII, and UTF-8 where needed (RFC 4252 §5, §8; RFC

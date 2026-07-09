@@ -41,6 +41,18 @@
                      (host-key-changed-error-expected-fingerprint c)
                      (host-key-changed-error-received-fingerprint c)))))
 
+(define-condition known-hosts-lock-error (error)
+  ((path :initarg :path :reader known-hosts-lock-error-path))
+  (:report (lambda (c s)
+             (format s "Timed out while waiting for known_hosts lock ~A"
+                     (known-hosts-lock-error-path c)))))
+
+(defparameter *known-hosts-lock-timeout-seconds* 10
+  "Maximum seconds to wait for another process to release the known_hosts lock.")
+
+(defparameter *known-hosts-lock-retry-delay-seconds* 1/20
+  "Seconds to wait between known_hosts lock acquisition attempts.")
+
 ;;;; Default known_hosts path
 
 (defun default-known-hosts-path ()
@@ -117,7 +129,7 @@
 
 (defun hostname-matches-entry-p (entry-hostname hostname)
   "Return true if ENTRY-HOSTNAME (from a known_hosts line) matches HOSTNAME."
-  (or (string= entry-hostname hostname)
+  (or (string-equal entry-hostname hostname)
       (hashed-hostname-matches-p entry-hostname hostname)))
 
 ;;;; Known hosts file parsing
@@ -164,13 +176,50 @@
 
 ;;;; Appending a new entry (TOFU)
 
-(defun add-known-host (path hostname key-type key-blob)
-  "Append a new entry to the known_hosts file at PATH."
+(defun known-hosts-lock-path (path)
+  (merge-pathnames (format nil ".~A.lock" (file-namestring path)) path))
+
+(defun try-create-known-hosts-lock (lock-path)
+  (let ((stream (open lock-path
+                      :direction :output
+                      :if-exists nil
+                      :if-does-not-exist :create)))
+    (when stream
+      (unwind-protect
+           (progn
+             (format stream "~D~%" (get-universal-time))
+             t)
+        (close stream)))))
+
+(defun call-with-known-hosts-lock (path thunk)
+  (ensure-directories-exist path)
+  (let ((lock-path (known-hosts-lock-path path))
+        (deadline (+ (get-universal-time)
+                     *known-hosts-lock-timeout-seconds*)))
+    (loop
+      (when (try-create-known-hosts-lock lock-path)
+        (return
+          (unwind-protect
+               (funcall thunk)
+            (ignore-errors
+             (delete-file lock-path)))))
+      (when (>= (get-universal-time) deadline)
+        (error 'known-hosts-lock-error :path lock-path))
+      (sleep *known-hosts-lock-retry-delay-seconds*))))
+
+(defun add-known-host-unlocked (path hostname key-type key-blob)
   (ensure-directories-exist path)
   (with-open-file (f path :direction :output
                           :if-exists :append
                           :if-does-not-exist :create)
     (format f "~A ~A ~A~%" hostname key-type (base64-encode key-blob))))
+
+(defun add-known-host (path hostname key-type key-blob)
+  "Append a new entry to the known_hosts file at PATH."
+  (call-with-known-hosts-lock
+   path
+   (lambda ()
+     (add-known-host-unlocked path hostname key-type key-blob))))
 
 (defun known-hosts-entry->line (entry)
   "Render ENTRY back to a known_hosts line."
@@ -180,8 +229,7 @@
           (base64-encode (known-hosts-entry-key-blob entry))
           (known-hosts-entry-comment entry)))
 
-(defun update-known-hosts (path hostname key-type key-blob)
-  "Rewrite matching known_hosts entries at PATH with KEY-BLOB."
+(defun update-known-hosts-unlocked (path hostname key-type key-blob)
   (let ((staging (merge-pathnames
                   (format nil ".~A.tmp" (gensym "KNOWN-HOSTS-"))
                   path)))
@@ -213,27 +261,16 @@
         (ignore-errors
          (delete-file staging))))))
 
+(defun update-known-hosts (path hostname key-type key-blob)
+  "Rewrite matching known_hosts entries at PATH with KEY-BLOB."
+  (call-with-known-hosts-lock
+   path
+   (lambda ()
+     (update-known-hosts-unlocked path hostname key-type key-blob))))
+
 ;;;; Main entry point
 
-(defun check-host-key (hostname key-type host-key-blob
-                       &key (known-hosts-path (default-known-hosts-path))
-                         (strict t))
-  "Verify HOST-KEY-BLOB against the known_hosts file.
-
-   HOSTNAME         — the server hostname string
-   KEY-TYPE         — the negotiated host-key algorithm string
-   HOST-KEY-BLOB    — the server's raw public key blob bytes
-   KNOWN-HOSTS-PATH — pathname to the known_hosts file
-   STRICT           — if true (default), reject changed keys; if false,
-                      only warn and accept the new key
-
-   Behaviour:
-     - If the host is not known: TOFU — add it and proceed.
-     - If the host is known with the same key: accept.
-     - If the host is known with a different key: signal HOST-KEY-CHANGED-ERROR
-       (when STRICT) or warn and update the entry (when not STRICT).
-
-   Returns :accepted-known, :accepted-tofu, or :accepted-changed."
+(defun check-host-key-unlocked (hostname key-type host-key-blob known-hosts-path strict)
   (let ((entries (load-known-hosts known-hosts-path))
         (received-fp (public-key-fingerprint host-key-blob)))
     ;; Find all entries for this hostname and key type
@@ -248,7 +285,7 @@
          (format *error-output*
                  "~&Warning: permanently added '~A' (~A) to the list of known hosts.~%"
                  hostname key-type)
-         (add-known-host known-hosts-path hostname key-type host-key-blob)
+         (add-known-host-unlocked known-hosts-path hostname key-type host-key-blob)
          :accepted-tofu)
 
         ;; At least one entry exists — check if any matches the received key
@@ -273,5 +310,30 @@
                            Received: ~A~%~
                            Proceeding (strict checking is disabled).~%"
                          hostname expected-fp received-fp)
-                 (update-known-hosts known-hosts-path hostname key-type host-key-blob)
+                 (update-known-hosts-unlocked known-hosts-path hostname key-type host-key-blob)
                  :accepted-changed))))))))
+
+(defun check-host-key (hostname key-type host-key-blob
+                       &key (known-hosts-path (default-known-hosts-path))
+                         (strict t))
+  "Verify HOST-KEY-BLOB against the known_hosts file.
+
+   HOSTNAME         — the server hostname string
+   KEY-TYPE         — the negotiated host-key algorithm string
+   HOST-KEY-BLOB    — the server's raw public key blob bytes
+   KNOWN-HOSTS-PATH — pathname to the known_hosts file
+   STRICT           — if true (default), reject changed keys; if false,
+                      only warn and accept the new key
+
+   Behaviour:
+     - If the host is not known: TOFU — add it and proceed.
+     - If the host is known with the same key: accept.
+     - If the host is known with a different key: signal HOST-KEY-CHANGED-ERROR
+       (when STRICT) or warn and update the entry (when not STRICT).
+
+   Returns :accepted-known, :accepted-tofu, or :accepted-changed."
+  (call-with-known-hosts-lock
+   known-hosts-path
+   (lambda ()
+     (check-host-key-unlocked hostname key-type host-key-blob
+                              known-hosts-path strict))))
