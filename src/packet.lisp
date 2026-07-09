@@ -215,14 +215,15 @@
 (defun make-hmac-mac-fn (key digest-name)
   "Return a MAC function (lambda (seq plaintext) -> octets) using HMAC.
    SEQ is a uint32 sequence number; PLAINTEXT is the full packet plaintext."
-  (lambda (seq plaintext)
-    (let ((mac (ironclad:make-mac :hmac key digest-name)))
+  (let ((mac (ironclad:make-mac :hmac key digest-name))
+        (seq-buf (make-array 4 :element-type '(unsigned-byte 8))))
+    (lambda (seq plaintext)
+      (reinitialize-instance mac :key key)
       ;; MAC input: uint32(seq) || plaintext
-      (let ((seq-buf (make-array 4 :element-type '(unsigned-byte 8))))
-        (setf (aref seq-buf 0) (ldb (byte 8 24) seq)
-              (aref seq-buf 1) (ldb (byte 8 16) seq)
-              (aref seq-buf 2) (ldb (byte 8  8) seq)
-              (aref seq-buf 3) (ldb (byte 8  0) seq))
-        (ironclad:update-mac mac seq-buf))
+      (setf (aref seq-buf 0) (ldb (byte 8 24) seq)
+            (aref seq-buf 1) (ldb (byte 8 16) seq)
+            (aref seq-buf 2) (ldb (byte 8  8) seq)
+            (aref seq-buf 3) (ldb (byte 8  0) seq))
+      (ironclad:update-mac mac seq-buf)
       (ironclad:update-mac mac plaintext)
       (ironclad:produce-mac mac))))

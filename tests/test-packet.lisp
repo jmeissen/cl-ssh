@@ -169,3 +169,39 @@
     (of-type 'ssh-protocol-error
       (handler-case (progn (recv-packet ps-recv) nil)
         (ssh-protocol-error (c) c)))))
+
+(define-test hmac-mac-fn-reuses-mac-object-between-packets
+  :parent (:ssh/tests ssh/tests)
+  (let ((key (octets 0 1 2 3 4 5 6 7
+                    8 9 10 11 12 13 14 15
+                    16 17 18 19 20 21 22 23
+                    24 25 26 27 28 29 30 31))
+        (plaintext (octets 0 0 0 12 4 94 1 2 3 4 5 6 7 8 9 10))
+        (original-make-mac (symbol-function 'ironclad:make-mac))
+        (make-mac-calls 0))
+    (flet ((fresh-mac (seq)
+             (let ((mac (funcall original-make-mac :hmac key :sha256))
+                   (seq-buf (make-array 4 :element-type '(unsigned-byte 8))))
+               (setf (aref seq-buf 0) (ldb (byte 8 24) seq)
+                     (aref seq-buf 1) (ldb (byte 8 16) seq)
+                     (aref seq-buf 2) (ldb (byte 8  8) seq)
+                     (aref seq-buf 3) (ldb (byte 8  0) seq))
+               (ironclad:update-mac mac seq-buf)
+               (ironclad:update-mac mac plaintext)
+               (ironclad:produce-mac mac))))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'ironclad:make-mac)
+                   (lambda (&rest args)
+                     (incf make-mac-calls)
+                     (apply original-make-mac args)))
+             (let* ((mac-fn (make-hmac-mac-fn key :sha256))
+                    (first-mac (funcall mac-fn 0 plaintext))
+                    (second-mac (funcall mac-fn 1 plaintext))
+                    (first-mac-again (funcall mac-fn 0 plaintext)))
+               (is = 1 make-mac-calls)
+               (is equalp (fresh-mac 0) first-mac)
+               (is equalp (fresh-mac 1) second-mac)
+               (is equalp first-mac first-mac-again)
+               (false (equalp first-mac second-mac))))
+        (setf (symbol-function 'ironclad:make-mac) original-make-mac)))))

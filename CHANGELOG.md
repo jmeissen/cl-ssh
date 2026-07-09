@@ -14,6 +14,7 @@
 - Integration tests through Docker and an additional integration testing system.
 
 ### Fixed
+- Reuse packet HMAC state between packets (for performance).
 - SSH data encoding, octets, US-ASCII, and UTF-8 where needed (RFC 4252 §5, §8; RFC
   4254 §5)
 
