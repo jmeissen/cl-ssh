@@ -59,8 +59,8 @@
   "Preferred host-key algorithms, most preferred first.")
 
 (defparameter +preferred-cipher+
-  (list +cipher-aes128-ctr+
-        +cipher-aes256-ctr+)
+  (list +cipher-aes256-ctr+
+        +cipher-aes128-ctr+)
   "Preferred symmetric ciphers, most preferred first.")
 
 (defparameter +preferred-mac+
