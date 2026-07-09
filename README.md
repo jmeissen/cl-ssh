@@ -281,9 +281,18 @@ cd cl-ssh
 qlot install
 ```
 ## Running tests
+### SBCL
 ``` shell
-sbcl --disable-debugger --load .qlot/setup.lisp --eval '(asdf:test-system :ssh)' --quit
+qlot exec sbcl --disable-debugger --eval '(asdf:test-system :ssh)' --quit
 ```
+### ECL
+``` shell
+qlot exec ecl --eval '(ql:quickload :ssh)' --eval '(asdf:test-system :ssh)' --nodebug -q --eval '(uiop:quit)'
+```
+
+> [!NOTE]
+> Because of non-optimized Ironclad bcrypt-pbkdf on some implementation
+> (including ECL) we only test passphrased client keys on SBCL.
 
 ## Integration tests
 

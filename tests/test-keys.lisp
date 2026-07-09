@@ -142,7 +142,10 @@
     (true (public-key k))))
 
 ;;;; ---- Encrypted keys with correct passphrase -----------------------------
+;;;; Because of non-optimized ironclad bcrypt-pbkdf, loading private keys is very
+;;;; slow for certain CL implementations (such as ECL). So we just skip them if not SBCL.
 
+#+sbcl
 (define-test load-ed25519-aes256-ctr
   :parent (:ssh/tests ssh/tests)
   "Ed25519 key encrypted with aes256-ctr decrypts with correct passphrase."
@@ -152,6 +155,7 @@
     (true (private-key k))
     (true (public-key k))))
 
+#+sbcl
 (define-test load-ed25519-aes128-cbc
   :parent (:ssh/tests ssh/tests)
   "Ed25519 key encrypted with aes128-cbc decrypts with correct passphrase."
@@ -161,6 +165,7 @@
     (true (private-key k))
     (true (public-key k))))
 
+#+sbcl
 (define-test load-rsa-aes256-ctr
   :parent (:ssh/tests ssh/tests)
   "RSA key encrypted with aes256-ctr decrypts with correct passphrase."
@@ -172,19 +177,21 @@
 
 ;;;; ---- Wrong passphrase ---------------------------------------------------
 
+#+sbcl
 (define-test wrong-passphrase-ed25519
   :parent (:ssh/tests ssh/tests)
   "A wrong passphrase produces KEY-ERROR (check1/check2 mismatch)."
   (fail (load-private-key (fixture "id_ed25519_aes256ctr")
                           :passphrase "this is definitely wrong")
-        'key-error))
+      'key-error))
 
+#+sbcl
 (define-test wrong-passphrase-rsa
   :parent (:ssh/tests ssh/tests)
   "A wrong passphrase on an RSA key produces KEY-ERROR."
   (fail (load-private-key (fixture "id_rsa_aes256ctr")
                           :passphrase "wrong")
-        'key-error))
+      'key-error))
 
 ;;;; ---- No passphrase supplied ---------------------------------------------
 
@@ -205,6 +212,7 @@
 
 ;;;; ---- SUPPLY-PASSPHRASE restart -----------------------------------------
 
+#+sbcl
 (define-test supply-passphrase-restart-ed25519
   :parent (:ssh/tests ssh/tests)
   "Invoking SUPPLY-PASSPHRASE restart yields a valid key without re-reading the file."
@@ -217,6 +225,7 @@
     (is string= "ssh-ed25519" (key-type k))
     (true (private-key k))))
 
+#+sbcl
 (define-test supply-passphrase-restart-rsa
   :parent (:ssh/tests ssh/tests)
   "SUPPLY-PASSPHRASE restart works for an encrypted RSA key."
@@ -245,6 +254,7 @@
     (declare (ignore _algo))
     (true (ironclad:verify-signature (public-key k) message raw-sig))))
 
+#+sbcl
 (define-test ed25519-sign-verify-passphrase
   :parent (:ssh/tests ssh/tests)
   "Ed25519 sign/verify round-trip for a passphrase-protected key (aes256-ctr)."
@@ -258,6 +268,7 @@
     (declare (ignore _algo))
     (true (ironclad:verify-signature (public-key k) message raw-sig))))
 
+#+sbcl
 (define-test ed25519-sign-verify-aes128-cbc
   :parent (:ssh/tests ssh/tests)
   "Ed25519 sign/verify round-trip for a passphrase-protected key (aes128-cbc)."
@@ -271,18 +282,19 @@
     (declare (ignore _algo))
     (true (ironclad:verify-signature (public-key k) message raw-sig))))
 
+#+sbcl
 (define-test rsa-sign-verify-passphrase
   :parent (:ssh/tests ssh/tests)
   "RSA sign/verify round-trip for a passphrase-protected key (aes256-ctr)."
   (let* ((k           (load-private-key (fixture "id_rsa_aes256ctr")
-                                         :passphrase +passphrase+))
+                                        :passphrase +passphrase+))
          (message     (map '(vector (unsigned-byte 8)) #'char-code "rsa passphrase test"))
          (sig-blob    (sign-auth-data k message))
          (sig-buf     (ssh/buffer:make-read-buffer sig-blob))
          (algo        (map 'string #'code-char (ssh/buffer:read-string* sig-buf)))
-              (raw-sig     (ssh/buffer:read-string* sig-buf))
-              (digest-name (if (string= algo "rsa-sha2-512") :sha512 :sha256)))
-     (true (ssh/keys::rsa-pkcs1-verify (public-key k) message raw-sig digest-name))))
+         (raw-sig     (ssh/buffer:read-string* sig-buf))
+         (digest-name (if (string= algo "rsa-sha2-512") :sha512 :sha256)))
+    (true (ssh/keys::rsa-pkcs1-verify (public-key k) message raw-sig digest-name))))
 
 (define-test rsa-publickey-auth-selects-strongest-advertised-algorithm
   :parent (:ssh/tests ssh/tests)
