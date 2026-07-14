@@ -39,42 +39,48 @@ qlot add ultralisp jmeissen-cl-ssh
 
 ### `with-connection`
 
-`with-connection` is the preferred way to use cl-ssh. It opens the connection, binds
-the client handle to a variable, runs the body, and always closes the connection on
-exit - including when an unhandled condition is signaled.
+Using `with-connection` is preferred. Connecting to existing hosts from
+`~/.ssh/config` is supported to a certain extent (see [SSH Config Support](#ssh-config-support) for details).
 
 ```lisp
 ;; Via ~/.ssh/config alias
 (ssh:with-connection (client "myserver")
   (multiple-value-bind (stdout stderr code)
       (ssh:run-command client "uname -a")
-    (format t "exit ~D~%~A" code stdout)))
+    (format t "exit ~D~%~A~%~A" code stdout stderr)))
 ```
 
-All keyword arguments accepted by `connect` can be passed after the host:
+All keyword arguments accepted by `ssh:connect` can be passed after the host:
 
+Public-key authentication with unencrypted key
 ```lisp
-;; Public-key authentication (unencrypted key)
 (ssh:with-connection (client "example.com"
                              :username "bob"
                              :identity "~/.ssh/id_ed25519")
   (ssh:run-command client "whoami"))
+```
 
-;; Public-key authentication (passphrase-protected key)
+Public-key authentication with passphrase-protected key
+```lisp
 (ssh:with-connection (client "example.com"
                              :username "bob"
                              :identity "~/.ssh/id_ed25519"
                              :passphrase "my passphrase")
   (ssh:run-command client "whoami"))
-
-;; Password authentication
+```
+Or with simple password authentication
+```lisp
 (ssh:with-connection (client "example.com"
                              :username "bob"
                              :password "secret")
   (ssh:run-command client "whoami"))
+```
 
-;; Multi-auth continuation: if the server accepts password auth partially,
-;; continue with the next allowed method via the AUTH-PARTIAL-SUCCESS restart.
+Multi-auth continuation is also supported. The server may partially accept a
+password and continue with the next allowed method through the
+`ssh:auth-partial-success` restart.
+
+```lisp
 (handler-bind ((ssh:auth-partial-success
                 (lambda (condition)
                   (declare (ignore condition))
@@ -85,8 +91,10 @@ All keyword arguments accepted by `connect` can be passed after the host:
                                :username "bob"
                                :password "secret")
     (ssh:run-command client "whoami")))
+```
 
-;; Keyboard-interactive authentication (RFC 4256)
+Keyboard-interactive authentication
+```lisp
 (ssh:with-connection (client "example.com"
                              :username "bob"
                              :keyboard-interactive-callback
@@ -98,12 +106,14 @@ All keyword arguments accepted by `connect` can be passed after the host:
                                          "secret")
                                        prompts)))
   (ssh:run-command client "whoami"))
+```
 
-;; Keyboard-interactive authentication from stdin.
-;; The helper prints the server name, instruction, and each prompt to standard
-;; output, then reads one response line per prompt from standard input.
-;; If you have a platform-specific reader for hidden input, pass it as
-;; :NO-ECHO-READER; otherwise the helper uses plain line input for all prompts.
+Finally, keyboard-interactive authentication from stdin for which you may use
+the helper which prints the server name, instruction, and each prompt to
+standard output, then reads one response line per prompt from standard input.
+If you have a platform-specific reader for hidden input, pass it as
+`:NO-ECHO-READER`, otherwise the helper uses plain line input for all prompts.
+```lisp
 (ssh:with-connection (client "example.com"
                              :username "bob"
                              :keyboard-interactive-callback
@@ -111,12 +121,14 @@ All keyword arguments accepted by `connect` can be passed after the host:
   (ssh:run-command client "whoami"))
 ```
 
-Explicit keyword arguments always override `~/.ssh/config`.
+> [!NOTE]
+> Explicit keyword arguments always override `~/.ssh/config`.
 
 ### Manual lifecycle
 
-When you need explicit control over the connection lifetime, use `connect` and
-`disconnect` directly, but wrap the body in `unwind-protect` to avoid leaks:
+When you need explicit control over the connection lifetime, use `ssh:connect`
+and `ssh:disconnect` directly, but wrap the body in `unwind-protect` to avoid
+leaks:
 
 ```lisp
 (let ((client (ssh:connect "myserver")))
@@ -126,8 +138,7 @@ When you need explicit control over the connection lifetime, use `connect` and
 ```
 
 ### Sending commands and receiving output
-#### run-command
-Single command execution.
+Single command execution with `ssh:run-command`.
 ```lisp
 (ssh:with-connection (client "my_host")
   (multiple-value-bind (stdout stderr exit-code)
@@ -136,8 +147,8 @@ Single command execution.
     (format t "~A" stdout)))
 ```
 
-#### open-shell
-Interactive shell.
+Interactive shells may be opened with `ssh:with-open-shell`.
+
 ```lisp
 (ssh:with-connection (client "my_host")
   (ssh:with-open-shell (shell client :pty nil)
@@ -146,14 +157,14 @@ Interactive shell.
     (format t "~A" (ssh:shell-read-until shell "__DONE__"))))
 ```
 
-Two helper functions are available: `ssh:shell-read-line` and `ssh:shell-read-until`.
-While `shell-read-line` drains bytes until EOL, `shell-read-until` drains bytes until
-`marker`. However, `marker` can be `NIL`, thereby reading/blocking indefinitely. Both
-can also drain bytes that are currently available on the shell stream without
-blocking: just drain what is available by passing `NIL` to `:block-p`. If the
-`marker` passed to `shell-read-until` is non-nil, then whichever is first will
-win. Additionally, errors may be suppressed with `:error-p NIL`, which may modify the
-second return value in the case of a condition.
+Two helper functions are available: `ssh:shell-read-line` and
+`ssh:shell-read-until`.  While `shell-read-line` drains bytes until EOL,
+`shell-read-until` drains bytes until `marker`. However, `marker` can be `NIL`,
+thereby reading/blocking indefinitely. Both can also drain bytes that are
+currently available on the shell stream without blocking and only drain what is
+available by passing `NIL` to `:block-p` - whichever is first will
+win. Additionally, errors may be suppressed with `:error-p NIL`, which may
+modify the second return value in the case of a condition.
 
 Here's an example of using `shell-read-until` as a non-blocking drain:
 
@@ -166,15 +177,17 @@ Here's an example of using `shell-read-until` as a non-blocking drain:
     (format t "~A" (ssh:shell-read-until shell nil :block-p nil))))
 ```
 
-`open-shell` itself still returns `(values stream channel)` for callers that need
-direct channel access. The helper functions operate on the returned binary stream
-and hide the string/octet conversion for common interactive-shell use.
+`ssh:open-shell` itself still returns `(values stream channel)` for callers that
+need direct channel access. The helper functions operate on the returned binary
+stream and hide the string/octet conversion for common interactive-shell
+use. The channel can be closed with the usual `close`.
 
-Shell commands default to `:pty nil`, which is for scripted shell interaction like
-the examples above. A pseudo-terminal is for terminal-oriented programs. With `:pty
-t`, servers commonly add prompts, echo typed commands, translate line endings, and
-emit terminal control sequences. Those bytes are returned as normal shell output, so
-marker-based reads may still work but the captured text is not machine-clean.
+Shell commands default to `:pty nil`, which is for scripted shell interaction
+like the examples above. A pseudo-terminal is for terminal-oriented
+programs. With `:pty t`, servers commonly add prompts, echo typed commands,
+translate line endings, and emit terminal control sequences. Those bytes are
+returned as normal shell output, so marker-based reads may still work but the
+captured text is not machine-clean.
 
 #### open-subsystem
 
@@ -222,7 +235,10 @@ The `Tested` column is shorthand: `Yes` means at least unit-test coverage exists
 | `keyboard-interactive` | Callback-based responses for RFC 4256 info requests (e.g. password/OTP prompts) |
 | `none`                 | Probe only                                                                      |
 
-If a server returns partial success, `ssh:auth-partial-success` is signaled. Handlers may invoke the `continue-authentication` restart with one of the server-offered methods and the arguments required for that method.
+If a server returns partial success, `ssh:auth-partial-success` is
+signaled. Handlers may invoke the `ssh/auth::continue-authentication` restart
+with one of the server-offered methods and the arguments required for that
+method.
 
 ## `~/.ssh/config` support
 
@@ -231,8 +247,8 @@ The following keywords are read and applied:
 `HostName`, `Port`, `User`, `IdentityFile`, `StrictHostKeyChecking`,
 `UserKnownHostsFile`, `RekeyLimit`
 
-All other keywords are silently ignored. `IdentitiesOnly` is not supported:
-even when set in the config, password authentication may still be attempted if
+All other keywords are silently ignored. `IdentitiesOnly` is not supported: even
+when set in the config, password authentication may still be attempted if
 `:password` is passed to `connect`.
 
 ## Known limitations
@@ -273,9 +289,9 @@ the RFC to claim full compliance.
 | RFC 9142            | Partial                            | Some recommended KEX methods are present, but extension negotiation and several recommended methods are absent.                                                                       |
 | RFC 9941            | None. Should be done in the future | `sntrup761x25519-sha512` and the OpenSSH alias are not implemented.                                                                                                                   |
 
-Quite some SSH RFCs are omitted. Some are deprecated, some too niche to even mention,
-or they do not seem relevant at the time of writing. Please open an issue upon
-disagreement.
+Quite some SSH RFCs are omitted. Some are deprecated, some too niche to even
+mention, or they do not seem relevant at the time of writing. Please open an
+issue upon disagreement.
 
 # Contributing
 ## Installing
@@ -295,14 +311,13 @@ qlot exec ecl --eval '(ql:quickload :ssh)' --eval '(asdf:test-system :ssh)' --no
 ```
 
 > [!NOTE]
-> Because of non-optimized Ironclad bcrypt-pbkdf on some implementation
+> Because of non-optimized Ironclad bcrypt-pbkdf on some implementations
 > (including ECL) we only test passphrased client keys on SBCL.
 
 ## Integration tests
 
 Live integration tests run against Docker Compose OpenSSH services on
-`127.0.0.1:2222-2226` (default, RSA variants, dedicated keyboard-interactive,
-and partial-success authentication).
+`127.0.0.1:2222-2228`.
 
 ``` shell
 ./scripts/run-integration-tests.sh
