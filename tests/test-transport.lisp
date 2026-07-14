@@ -149,15 +149,132 @@
   :parent (:ssh/tests ssh/tests)
   (let* ((payload (ssh/algorithms:kexinit-payload))
          (server-kexinit (ssh/algorithms:parse-kexinit payload)))
-    (setf (ssh/algorithms::kexinit-mac-algorithms-c2s server-kexinit)
-            (list ssh/constants:+mac-hmac-sha2-512+)
+    (setf (ssh/algorithms::kexinit-encryption-algorithms-c2s server-kexinit)
+          (list ssh/constants:+cipher-aes256-ctr+)
+          (ssh/algorithms::kexinit-encryption-algorithms-s2c server-kexinit)
+          (list ssh/constants:+cipher-aes256-ctr+)
+          (ssh/algorithms::kexinit-mac-algorithms-c2s server-kexinit)
+          (list ssh/constants:+mac-hmac-sha2-512+)
           (ssh/algorithms::kexinit-mac-algorithms-s2c server-kexinit)
-            (list ssh/constants:+mac-hmac-sha2-512+))
+          (list ssh/constants:+mac-hmac-sha2-512+))
     (let ((negotiated (ssh/algorithms:negotiate-algorithms server-kexinit)))
       (is string= ssh/constants:+mac-hmac-sha2-512+
           (ssh/algorithms::negotiated-mac-c2s negotiated))
       (is string= ssh/constants:+mac-hmac-sha2-512+
           (ssh/algorithms::negotiated-mac-s2c negotiated)))))
+
+(define-test kexinit-advertises-openssh-and-rfc5647-gcm
+  :parent (:ssh/tests ssh/tests)
+  (let* ((payload (ssh/algorithms:kexinit-payload))
+         (kexinit (ssh/algorithms:parse-kexinit payload)))
+    (dolist (algorithm
+             (list ssh/constants:+cipher-aes256-gcm-openssh+
+                   ssh/constants:+cipher-aes128-gcm-openssh+
+                   ssh/constants:+aead-aes256-gcm+
+                   ssh/constants:+aead-aes128-gcm+))
+      (true (member algorithm
+                    (ssh/algorithms::kexinit-encryption-algorithms-c2s kexinit)
+                    :test #'string=)))
+    (dolist (algorithm
+             (list ssh/constants:+aead-aes256-gcm+
+                   ssh/constants:+aead-aes128-gcm+))
+      (true (member algorithm
+                    (ssh/algorithms::kexinit-mac-algorithms-c2s kexinit)
+                    :test #'string=)))))
+
+(define-test negotiate-openssh-gcm-uses-implicit-authentication
+  :parent (:ssh/tests ssh/tests)
+  (let* ((payload (ssh/algorithms:kexinit-payload))
+         (server-kexinit (ssh/algorithms:parse-kexinit payload)))
+    (setf (ssh/algorithms::kexinit-encryption-algorithms-c2s server-kexinit)
+          (list ssh/constants:+cipher-aes256-gcm-openssh+)
+          (ssh/algorithms::kexinit-encryption-algorithms-s2c server-kexinit)
+          (list ssh/constants:+cipher-aes256-gcm-openssh+)
+          (ssh/algorithms::kexinit-mac-algorithms-c2s server-kexinit)
+          (list ssh/constants:+mac-hmac-sha2-256+)
+          (ssh/algorithms::kexinit-mac-algorithms-s2c server-kexinit)
+          (list ssh/constants:+mac-hmac-sha2-256+))
+    (let ((negotiated (ssh/algorithms:negotiate-algorithms server-kexinit)))
+      (is string= ssh/constants:+cipher-aes256-gcm-openssh+
+          (ssh/algorithms::negotiated-cipher-c2s negotiated))
+      (null (ssh/algorithms::negotiated-mac-c2s negotiated))
+      (null (ssh/algorithms::negotiated-mac-s2c negotiated)))))
+
+(define-test negotiate-rfc5647-gcm-requires-the-matching-mac-name
+  :parent (:ssh/tests ssh/tests)
+  (let* ((payload (ssh/algorithms:kexinit-payload))
+         (server-kexinit (ssh/algorithms:parse-kexinit payload)))
+    (setf (ssh/algorithms::kexinit-encryption-algorithms-c2s server-kexinit)
+          (list ssh/constants:+aead-aes128-gcm+)
+          (ssh/algorithms::kexinit-encryption-algorithms-s2c server-kexinit)
+          (list ssh/constants:+aead-aes128-gcm+)
+          (ssh/algorithms::kexinit-mac-algorithms-c2s server-kexinit)
+          (list ssh/constants:+aead-aes128-gcm+)
+          (ssh/algorithms::kexinit-mac-algorithms-s2c server-kexinit)
+          (list ssh/constants:+aead-aes128-gcm+))
+    (let ((negotiated (ssh/algorithms:negotiate-algorithms server-kexinit)))
+      (is string= ssh/constants:+aead-aes128-gcm+
+          (ssh/algorithms::negotiated-mac-c2s negotiated)))
+    (setf (ssh/algorithms::kexinit-mac-algorithms-c2s server-kexinit)
+          (list ssh/constants:+mac-hmac-sha2-256+))
+    (fail (ssh/algorithms:negotiate-algorithms server-kexinit)
+        'error)))
+
+(define-test gcm-algorithm-metadata-matches-the-ssh-profiles
+  :parent (:ssh/tests ssh/tests)
+  (dolist (algorithm
+           (list ssh/constants:+cipher-aes128-gcm-openssh+
+                 ssh/constants:+aead-aes128-gcm+))
+    (is = 16 (ssh/transport::cipher-key-length algorithm))
+    (is = 12 (ssh/transport::cipher-iv-length algorithm))
+    (is = 16 (ssh/transport::cipher-block-size algorithm)))
+  (dolist (algorithm
+           (list ssh/constants:+cipher-aes256-gcm-openssh+
+                 ssh/constants:+aead-aes256-gcm+))
+    (is = 32 (ssh/transport::cipher-key-length algorithm))
+    (is = 12 (ssh/transport::cipher-iv-length algorithm))
+    (is = 16 (ssh/transport::cipher-block-size algorithm)))
+  (is = 0 (ssh/transport::mac-key-length nil))
+  (is = 0 (ssh/transport::mac-key-length ssh/constants:+aead-aes128-gcm+))
+  (is = 0 (ssh/transport::mac-key-length ssh/constants:+aead-aes256-gcm+)))
+
+(define-test gcm-kex-key-installation-is-directional-and-resets-the-iv
+  :parent (:ssh/tests ssh/tests)
+  (let* ((ps (ssh/packet:make-packet-stream (make-input-stream "")))
+         (result (dummy-kex-result (ssh/tests:octets 9 8 7)))
+         (negotiated
+           (ssh/algorithms::make-negotiated
+            :cipher-c2s ssh/constants:+cipher-aes256-gcm-openssh+
+            :cipher-s2c ssh/constants:+aead-aes128-gcm+
+            :mac-c2s nil
+            :mac-s2c ssh/constants:+aead-aes128-gcm+)))
+    (ssh/transport::install-kex-result-keys ps result negotiated :out)
+    (of-type 'ssh/packet::gcm-protection
+             (ssh/packet::packet-stream-protection-out ps))
+    (of-type 'ssh/packet::classic-protection
+             (ssh/packet::packet-stream-protection-in ps))
+    (is = 32
+        (length
+         (ssh/packet::gcm-protection-key
+          (ssh/packet::packet-stream-protection-out ps))))
+    (is = 12
+        (length
+         (ssh/packet::gcm-protection-iv
+          (ssh/packet::packet-stream-protection-out ps))))
+    (ssh/packet::reserve-gcm-iv
+     (ssh/packet::packet-stream-protection-out ps))
+    (ssh/transport::install-kex-result-keys ps result negotiated :out)
+    (is equalp
+        (make-array 12 :element-type '(unsigned-byte 8) :initial-element 1)
+        (ssh/packet::gcm-protection-iv
+         (ssh/packet::packet-stream-protection-out ps)))
+    (ssh/transport::install-kex-result-keys ps result negotiated :in)
+    (of-type 'ssh/packet::gcm-protection
+             (ssh/packet::packet-stream-protection-in ps))
+    (is = 16
+        (length
+         (ssh/packet::gcm-protection-key
+          (ssh/packet::packet-stream-protection-in ps))))))
 
 (define-test kexinit-advertises-ext-info-c
   :parent (:ssh/tests ssh/tests)
@@ -183,19 +300,19 @@
 
 (define-test ext-info-extension-names-are-us-ascii
   :parent (:ssh/tests ssh/tests)
-  (let ((payload (ext-info-payload (list (coerce '(#xff) '(vector (unsigned-byte 8)))
-                                        (ssh/tests:octets 1 2 3)))))
+  (let ((payload (ext-info-payload (list (coerce '(255) '(vector (unsigned-byte 8)))
+                                         (ssh/tests:octets 1 2 3)))))
     (fail (ssh/transport::parse-ext-info-payload payload)
-          'ssh/transport:transport-error)))
+        'ssh/transport:transport-error)))
 
 (define-test ext-info-server-sig-algs-is-us-ascii-name-list
   :parent (:ssh/tests ssh/tests)
   (let ((payload (ext-info-payload (list "server-sig-algs"
-                                        (ssh/tests:octets #x73 #x73 #x68 #xff)))))
+                                         (ssh/tests:octets 115 115 104 255)))))
     (fail (ssh/transport::process-ext-info
            (ssh/transport::make-transport)
            payload)
-          'ssh/transport:transport-error)))
+        'ssh/transport:transport-error)))
 
 (define-test ext-info-replaces-previous-server-sig-algs
   :parent (:ssh/tests ssh/tests)
@@ -213,7 +330,7 @@
           (append (ssh/algorithms::kexinit-kex-algorithms kexinit)
                   (list ssh/constants::+ext-info-c+)))
     (fail (ssh/transport::validate-server-kexinit kexinit)
-          'ssh/transport::transport-error)))
+        'ssh/transport::transport-error)))
 
 (define-test rekey-policy-detects-packet-byte-and-time-limits
   :parent (:ssh/tests ssh/tests)
@@ -240,11 +357,11 @@
   (is eq nil (ssh/transport::normalize-rekey-limit nil 10))
   (is = 64 (ssh/transport::normalize-rekey-limit 64 10))
   (fail (ssh/transport::normalize-rekey-limit 0 10)
-        'ssh/transport:transport-error)
+      'ssh/transport:transport-error)
   (fail (ssh/transport::normalize-rekey-limit -1 10)
-        'ssh/transport:transport-error)
+      'ssh/transport:transport-error)
   (fail (ssh/transport::normalize-rekey-limit "64K" 10)
-        'ssh/transport:transport-error))
+      'ssh/transport:transport-error))
 
 (define-test transport-send-initiates-rekey-before-application-data
   :parent (:ssh/tests ssh/tests)
@@ -314,7 +431,7 @@
            (fail (ssh/transport:transport-send
                   transport
                   (ssh/tests:octets ssh/constants::+msg-ignore+ 1))
-                 'ssh/packet:ssh-protocol-error))
+               'ssh/packet:ssh-protocol-error))
       (setf (symbol-function 'ssh/packet:send-packet) original-send
             (symbol-function 'ssh/packet:recv-packet) original-recv))))
 
@@ -422,7 +539,7 @@
            (fail (ssh/transport:transport-send
                   transport
                   (ssh/tests:octets ssh/constants::+msg-ignore+ 1))
-                 'ssh/transport:transport-error))
+               'ssh/transport:transport-error))
       (setf (symbol-function 'ssh/packet:send-packet) original-send
             (symbol-function 'ssh/packet:recv-packet) original-recv))))
 
@@ -451,6 +568,6 @@
            (fail (ssh/transport:transport-send
                   transport
                   (ssh/tests:octets ssh/constants::+msg-ignore+ 1))
-                 'ssh/transport:transport-error))
+               'ssh/transport:transport-error))
       (setf (symbol-function 'ssh/packet:send-packet) original-send
             (symbol-function 'ssh/packet:recv-packet) original-recv))))

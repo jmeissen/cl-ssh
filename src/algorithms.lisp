@@ -15,6 +15,10 @@
                 #:+host-key-rsa-sha2-512+
                 #:+cipher-aes128-ctr+
                 #:+cipher-aes256-ctr+
+                #:+cipher-aes128-gcm-openssh+
+                #:+cipher-aes256-gcm-openssh+
+                #:+aead-aes128-gcm+
+                #:+aead-aes256-gcm+
                 #:+mac-hmac-sha2-256+
                 #:+mac-hmac-sha2-512+
                 #:+compression-none+
@@ -30,6 +34,7 @@
    #:+preferred-cipher+
    #:+preferred-mac+
    #:+preferred-compression+
+   #:gcm-cipher-p
    #:kexinit-payload
    #:parse-kexinit
    #:negotiate-algorithms
@@ -59,18 +64,44 @@
   "Preferred host-key algorithms, most preferred first.")
 
 (defparameter +preferred-cipher+
-  (list +cipher-aes256-ctr+
+  (list +cipher-aes256-gcm-openssh+
+        +cipher-aes128-gcm-openssh+
+        +aead-aes256-gcm+
+        +aead-aes128-gcm+
+        +cipher-aes256-ctr+
         +cipher-aes128-ctr+)
   "Preferred symmetric ciphers, most preferred first.")
 
 (defparameter +preferred-mac+
-  (list +mac-hmac-sha2-256+
+  (list +aead-aes256-gcm+
+        +aead-aes128-gcm+
+        +mac-hmac-sha2-256+
         +mac-hmac-sha2-512+)
   "Preferred MAC algorithms, most preferred first.")
 
 (defparameter +preferred-compression+
   (list +compression-none+)
   "Preferred compression algorithms (none only for now).")
+
+(defparameter +preferred-classic-mac+
+  (list +mac-hmac-sha2-256+
+        +mac-hmac-sha2-512+)
+  "Preferred standalone MAC algorithms, most preferred first.")
+
+(defun openssh-gcm-cipher-p (algorithm)
+  (or (string= algorithm +cipher-aes128-gcm-openssh+)
+      (string= algorithm +cipher-aes256-gcm-openssh+)))
+
+(defun rfc5647-gcm-cipher-p (algorithm)
+  (or (string= algorithm +aead-aes128-gcm+)
+      (string= algorithm +aead-aes256-gcm+)))
+
+(defun gcm-cipher-p (algorithm)
+  "Return whether ALGORITHM names a supported AES-GCM cipher.
+ALGORITHM is an SSH encryption algorithm name.
+Returns true for the OpenSSH and RFC 5647 AES-GCM profiles, or false otherwise."
+  (or (openssh-gcm-cipher-p algorithm)
+      (rfc5647-gcm-cipher-p algorithm)))
 
 (defparameter +kex-extension-markers+
   (list +ext-info-c+)
@@ -159,6 +190,24 @@
   mac-c2s    mac-s2c
   compression-c2s compression-s2c)
 
+(defun negotiate-protection (direction server-ciphers server-macs)
+  (let ((cipher (or (first-match +preferred-cipher+ server-ciphers)
+                    (error "No common cipher ~A algorithm with server~%  ours:   ~A~%  theirs: ~A"
+                           direction +preferred-cipher+ server-ciphers))))
+    (values
+     cipher
+     (cond
+       ((openssh-gcm-cipher-p cipher)
+        nil)
+       ((rfc5647-gcm-cipher-p cipher)
+        (or (find cipher server-macs :test #'string=)
+            (error "RFC 5647 cipher ~A requires the same name in the server MAC ~A list"
+                   cipher direction)))
+       (t
+        (or (first-match +preferred-classic-mac+ server-macs)
+            (error "No common MAC ~A algorithm with server~%  ours:   ~A~%  theirs: ~A"
+                   direction +preferred-classic-mac+ server-macs)))))))
+
 (defun negotiate-algorithms (server-kexinit)
   "Select algorithms by matching our preference lists against the server's
    KEXINIT.  Returns a NEGOTIATED struct or signals an error on failure."
@@ -166,28 +215,30 @@
            (or (first-match our-list server-list)
                (error "No common ~A algorithm with server~%  ours:   ~A~%  theirs: ~A"
                       category our-list server-list))))
-    (make-negotiated
-     :kex            (pick "KEX"
-                           +preferred-kex+
-                           (kexinit-kex-algorithms server-kexinit))
-     :host-key       (pick "host-key"
-                           +preferred-host-key+
-                           (kexinit-server-host-key-algorithms server-kexinit))
-     :cipher-c2s     (pick "cipher c→s"
-                           +preferred-cipher+
-                           (kexinit-encryption-algorithms-c2s server-kexinit))
-     :cipher-s2c     (pick "cipher s→c"
-                           +preferred-cipher+
-                           (kexinit-encryption-algorithms-s2c server-kexinit))
-     :mac-c2s        (pick "MAC c→s"
-                           +preferred-mac+
-                           (kexinit-mac-algorithms-c2s server-kexinit))
-     :mac-s2c        (pick "MAC s→c"
-                           +preferred-mac+
-                           (kexinit-mac-algorithms-s2c server-kexinit))
-     :compression-c2s (pick "compression c→s"
-                            +preferred-compression+
-                            (kexinit-compression-algorithms-c2s server-kexinit))
-     :compression-s2c (pick "compression s→c"
-                            +preferred-compression+
-                            (kexinit-compression-algorithms-s2c server-kexinit)))))
+    (multiple-value-bind (cipher-c2s mac-c2s)
+        (negotiate-protection
+         "c→s"
+         (kexinit-encryption-algorithms-c2s server-kexinit)
+         (kexinit-mac-algorithms-c2s server-kexinit))
+      (multiple-value-bind (cipher-s2c mac-s2c)
+          (negotiate-protection
+           "s→c"
+           (kexinit-encryption-algorithms-s2c server-kexinit)
+           (kexinit-mac-algorithms-s2c server-kexinit))
+        (make-negotiated
+         :kex (pick "KEX"
+                    +preferred-kex+
+                    (kexinit-kex-algorithms server-kexinit))
+         :host-key (pick "host-key"
+                         +preferred-host-key+
+                         (kexinit-server-host-key-algorithms server-kexinit))
+         :cipher-c2s cipher-c2s
+         :cipher-s2c cipher-s2c
+         :mac-c2s mac-c2s
+         :mac-s2c mac-s2c
+         :compression-c2s (pick "compression c→s"
+                                +preferred-compression+
+                                (kexinit-compression-algorithms-c2s server-kexinit))
+         :compression-s2c (pick "compression s→c"
+                                +preferred-compression+
+                                (kexinit-compression-algorithms-s2c server-kexinit)))))))

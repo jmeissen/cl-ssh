@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- AES-128-GCM and AES-256-GCM packet protection using both the RFC 5647
+  `AEAD_AES_*_GCM` names and the common `aes*-gcm@openssh.com` names.
 - Honor `RekeyLimit` configuration and expose `ssh:connect`
   `:rekey-byte-limit` / `:rekey-seconds-limit` overrides.
 - Support transport key re-exchange after the initial key exchange (RFC 4253 §9),

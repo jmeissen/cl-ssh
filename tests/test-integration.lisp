@@ -98,6 +98,12 @@
 (defun integration-partial-success-port ()
   (env-port "SSH_TEST_PARTIAL_SUCCESS_PORT"))
 
+(defun integration-aes256-gcm-port ()
+  (env-port "SSH_TEST_AES256_GCM_PORT"))
+
+(defun integration-aes128-gcm-port ()
+  (env-port "SSH_TEST_AES128_GCM_PORT"))
+
 (defun keyboard-interactive-response-callback (response)
   (lambda (name instruction language-tag prompts)
     (declare (ignore name instruction language-tag))
@@ -186,6 +192,75 @@
                   (true t))))
       (skip "requires an RSA algorithm-specific SSH_TEST_*_PORT"
             (true t))))
+
+(defun gcm-live-test (port expected-key-length &key rekey-p)
+  (if port
+      (let ((target (integration-target port)))
+        (if target
+            (let ((known-hosts (write-empty-known-hosts)))
+              (unwind-protect
+                   (with-connection (client (integration-target-host target)
+                                            :port (integration-target-port target)
+                                            :username (integration-target-user target)
+                                            :known-hosts-path known-hosts
+                                            :identity (fixture-path "id_ed25519_nopass")
+                                            :strict-host-checking t)
+                     (let* ((transport (client-transport client))
+                            (packet-stream
+                              (ssh/transport:transport-packet-stream transport))
+                            (outbound
+                              (ssh/packet::packet-stream-protection-out packet-stream))
+                            (inbound
+                              (ssh/packet::packet-stream-protection-in packet-stream)))
+                       (of-type 'ssh/packet::gcm-protection outbound)
+                       (of-type 'ssh/packet::gcm-protection inbound)
+                       (false (eq outbound inbound))
+                       (is = expected-key-length
+                           (length (ssh/packet::gcm-protection-key outbound)))
+                       (is = expected-key-length
+                           (length (ssh/packet::gcm-protection-key inbound)))
+                       (let ((outbound-iv-before
+                               (copy-seq (ssh/packet::gcm-protection-iv outbound)))
+                             (inbound-iv-before
+                               (copy-seq (ssh/packet::gcm-protection-iv inbound))))
+                         (is = 12 (length outbound-iv-before))
+                         (is = 12 (length inbound-iv-before))
+                         (assert-live-command client "printf gcm-packet-ok" "gcm-packet-ok")
+                         (let ((outbound-iv-after
+                                 (ssh/packet::gcm-protection-iv outbound))
+                               (inbound-iv-after
+                                 (ssh/packet::gcm-protection-iv inbound)))
+                           (is equalp (subseq outbound-iv-before 0 4)
+                               (subseq outbound-iv-after 0 4))
+                           (is equalp (subseq inbound-iv-before 0 4)
+                               (subseq inbound-iv-after 0 4))
+                           (false (equalp outbound-iv-before outbound-iv-after))
+                           (false (equalp inbound-iv-before inbound-iv-after)))
+                         (multiple-value-bind (stdout stderr exit-code)
+                             (run-command client "yes gcm | head -c 65536")
+                           (is = 65536 (length stdout))
+                           (is string= "" stderr)
+                           (is = 0 exit-code))
+                         (when rekey-p
+                           (ssh/transport::transport-rekey transport)
+                           (let ((new-outbound
+                                   (ssh/packet::packet-stream-protection-out packet-stream))
+                                 (new-inbound
+                                   (ssh/packet::packet-stream-protection-in packet-stream)))
+                             (of-type 'ssh/packet::gcm-protection new-outbound)
+                             (of-type 'ssh/packet::gcm-protection new-inbound)
+                             (false (eq outbound new-outbound))
+                             (false (eq inbound new-inbound)))
+                           (assert-live-command client
+                                                "printf gcm-rekey-ok"
+                                                "gcm-rekey-ok")))))
+                (ignore-errors
+                 (delete-file (ssh/known-hosts::known-hosts-lock-path known-hosts)))
+                (ignore-errors (delete-file known-hosts))))
+            (skip "requires SSH_TEST_HOST, SSH_TEST_USER, SSH_TEST_KNOWN_HOSTS, and a GCM port"
+              (true t))))
+      (skip "requires an SSH_TEST_AES*_GCM_PORT"
+        (true t))))
 
 (defmacro with-live-client ((client &key identity passphrase password port
                                       keyboard-interactive-callback
@@ -410,6 +485,14 @@
       (is equal '(0 128 255) (map 'list #'identity stdout))
       (is = 0 (length stderr))
       (is = 0 exit-code))))
+
+(define-test aes256-gcm-openssh-packets-and-rekey-work
+  :parent (:ssh/integration-tests ssh/integration-tests)
+  (gcm-live-test (integration-aes256-gcm-port) 32 :rekey-p t))
+
+(define-test aes128-gcm-openssh-packets-work
+  :parent (:ssh/integration-tests ssh/integration-tests)
+  (gcm-live-test (integration-aes128-gcm-port) 16))
 
 (define-test rekey-after-time-limit-keeps-session-usable
   :parent (:ssh/integration-tests ssh/integration-tests)

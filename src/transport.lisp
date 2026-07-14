@@ -28,6 +28,10 @@
                 #:+service-userauth+
                 #:+cipher-aes128-ctr+
                 #:+cipher-aes256-ctr+
+                #:+cipher-aes128-gcm-openssh+
+                #:+cipher-aes256-gcm-openssh+
+                #:+aead-aes128-gcm+
+                #:+aead-aes256-gcm+
                 #:+mac-hmac-sha2-256+
                 #:+mac-hmac-sha2-512+
                 #:+client-version-string+
@@ -40,13 +44,15 @@
                 #:make-read-buffer #:read-byte* #:read-uint32 #:read-string*
                 #:read-remaining-bytes #:read-name-list)
   (:import-from #:ssh/packet
-                #:make-packet-stream #:send-packet #:recv-packet #:install-keys
+                #:make-packet-stream #:send-packet #:recv-packet
+                #:install-keys #:install-gcm-keys
                 #:make-hmac-mac-fn #:ssh-protocol-error
                 #:packet-stream-packets-out #:packet-stream-packets-in
                 #:packet-stream-bytes-out #:packet-stream-bytes-in)
   (:import-from #:ssh/algorithms
                 #:kexinit-payload #:parse-kexinit #:kexinit-kex-algorithms
                 #:negotiate-algorithms
+                #:gcm-cipher-p
                 #:negotiated-kex #:negotiated-host-key
                 #:negotiated-cipher-c2s #:negotiated-cipher-s2c
                 #:negotiated-mac-c2s #:negotiated-mac-s2c)
@@ -138,21 +144,43 @@
 
 (defun cipher-key-length (algorithm)
   "Return the key length in bytes for the named cipher algorithm."
-  (cond ((string= algorithm +cipher-aes128-ctr+) 16)
-        ((string= algorithm +cipher-aes256-ctr+) 32)
+  (cond ((member algorithm
+                 (list +cipher-aes128-ctr+
+                       +cipher-aes128-gcm-openssh+
+                       +aead-aes128-gcm+)
+                 :test #'string=)
+         16)
+        ((member algorithm
+                 (list +cipher-aes256-ctr+
+                       +cipher-aes256-gcm-openssh+
+                       +aead-aes256-gcm+)
+                 :test #'string=)
+         32)
         (t (error 'transport-error
                   :message (format nil "unsupported cipher: ~S" algorithm)))))
 
 (defun cipher-block-size (algorithm)
-  "Return the block/IV size in bytes for the named cipher algorithm."
-  (cond ((string= algorithm +cipher-aes128-ctr+) 16)
-        ((string= algorithm +cipher-aes256-ctr+) 16)
+  "Return the block size in bytes for the named cipher algorithm."
+  (cond ((or (gcm-cipher-p algorithm)
+             (string= algorithm +cipher-aes128-ctr+)
+             (string= algorithm +cipher-aes256-ctr+))
+         16)
         (t (error 'transport-error
                   :message (format nil "unsupported cipher: ~S" algorithm)))))
 
+(defun cipher-iv-length (algorithm)
+  "Return the KDF IV length in bytes for the named cipher algorithm."
+  (if (gcm-cipher-p algorithm)
+      12
+      (cipher-block-size algorithm)))
+
 (defun mac-key-length (algorithm)
   "Return the MAC key length in bytes for the named MAC algorithm."
-  (cond ((string= algorithm +mac-hmac-sha2-256+) 32)
+  (cond ((or (null algorithm)
+             (string= algorithm +aead-aes128-gcm+)
+             (string= algorithm +aead-aes256-gcm+))
+         0)
+        ((string= algorithm +mac-hmac-sha2-256+) 32)
         ((string= algorithm +mac-hmac-sha2-512+) 64)
         (t (error 'transport-error
                   :message (format nil "unsupported MAC: ~S" algorithm)))))
@@ -391,30 +419,34 @@
      (let* ((cipher-name (negotiated-cipher-c2s negotiated))
             (mac-name    (negotiated-mac-c2s negotiated))
             (iv          (prefix-octets (kex-result-iv-c2s kex-result)
-                                        (cipher-block-size cipher-name)))
+                                        (cipher-iv-length cipher-name)))
             (key         (prefix-octets (kex-result-key-c2s kex-result)
-                                        (cipher-key-length cipher-name)))
-            (mac-key     (prefix-octets (kex-result-mac-c2s kex-result)
-                                        (mac-key-length mac-name))))
-       (install-keys packet-stream
-         :cipher-out     (make-aes-ctr-cipher key iv)
-         :block-size-out (cipher-block-size cipher-name)
-         :mac-out        (make-hmac-mac-fn mac-key (mac-digest-name mac-name))
-         :mac-length-out (mac-output-length mac-name))))
+                                        (cipher-key-length cipher-name))))
+       (if (gcm-cipher-p cipher-name)
+           (install-gcm-keys packet-stream :key-out key :iv-out iv)
+           (let ((mac-key (prefix-octets (kex-result-mac-c2s kex-result)
+                                         (mac-key-length mac-name))))
+             (install-keys packet-stream
+               :cipher-out     (make-aes-ctr-cipher key iv)
+               :block-size-out (cipher-block-size cipher-name)
+               :mac-out        (make-hmac-mac-fn mac-key (mac-digest-name mac-name))
+               :mac-length-out (mac-output-length mac-name))))))
     (:in
      (let* ((cipher-name (negotiated-cipher-s2c negotiated))
             (mac-name    (negotiated-mac-s2c negotiated))
             (iv          (prefix-octets (kex-result-iv-s2c kex-result)
-                                        (cipher-block-size cipher-name)))
+                                        (cipher-iv-length cipher-name)))
             (key         (prefix-octets (kex-result-key-s2c kex-result)
-                                        (cipher-key-length cipher-name)))
-            (mac-key     (prefix-octets (kex-result-mac-s2c kex-result)
-                                        (mac-key-length mac-name))))
-       (install-keys packet-stream
-         :cipher-in      (make-aes-ctr-cipher key iv)
-         :block-size-in  (cipher-block-size cipher-name)
-         :mac-in         (make-hmac-mac-fn mac-key (mac-digest-name mac-name))
-         :mac-length-in  (mac-output-length mac-name))))))
+                                        (cipher-key-length cipher-name))))
+       (if (gcm-cipher-p cipher-name)
+           (install-gcm-keys packet-stream :key-in key :iv-in iv)
+           (let ((mac-key (prefix-octets (kex-result-mac-s2c kex-result)
+                                         (mac-key-length mac-name))))
+             (install-keys packet-stream
+               :cipher-in      (make-aes-ctr-cipher key iv)
+               :block-size-in  (cipher-block-size cipher-name)
+               :mac-in         (make-hmac-mac-fn mac-key (mac-digest-name mac-name))
+               :mac-length-in  (mac-output-length mac-name))))))))
 
 (defun perform-negotiated-key-exchange (transport client-kexinit-payload server-kexinit-payload)
   (unless (= (or (payload-message-type server-kexinit-payload) -1) +msg-kexinit+)
@@ -439,8 +471,8 @@
                            server-kexinit-payload
                            (transport-session-id transport)
                            key-verifier
-                           :iv-length (max (cipher-block-size cipher-c2s)
-                                           (cipher-block-size cipher-s2c))
+                           :iv-length (max (cipher-iv-length cipher-c2s)
+                                           (cipher-iv-length cipher-s2c))
                            :cipher-key-length (max (cipher-key-length cipher-c2s)
                                                    (cipher-key-length cipher-s2c))
                            :mac-key-length (max (mac-key-length mac-c2s-name)

@@ -53,3 +53,17 @@ services:
       - "AuthenticationMethods=keyboard-interactive"
       - "-o"
       - "PasswordAuthentication=no"
+  sshd-aes256-gcm:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "127.0.0.1:2227:22"
+    command: ["-o", "Ciphers=aes256-gcm@openssh.com"]
+  sshd-aes128-gcm:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "127.0.0.1:2228:22"
+    command: ["-o", "Ciphers=aes128-gcm@openssh.com"]

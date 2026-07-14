@@ -113,7 +113,7 @@
 
 (define-test key-derivation-lengths
   :parent (:ssh/tests ssh/tests)
-  (dolist (n '(16 32 64))
+  (dolist (n '(0 16 32 64))
     (let ((key (derive-key *test-k* *test-h* #\A *test-h* n)))
       (is = n (length key)
           (format nil "derive-key with n=~D returned wrong length" n)))))

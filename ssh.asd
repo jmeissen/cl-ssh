@@ -18,6 +18,7 @@
   :serial t
   :components ((:file "tests/package")
                (:file "tests/test-buffer")
+               (:file "tests/test-gcm")
                (:file "tests/test-packet")
                (:file "tests/test-kex")
                (:file "tests/test-kex-dh")

@@ -8,6 +8,7 @@
     #:send-packet
     #:recv-packet
     #:install-keys
+    #:install-gcm-keys
     #:make-hmac-mac-fn
     #:ssh-protocol-error))
 
@@ -205,3 +206,84 @@
                (is equalp first-mac first-mac-again)
                (false (equalp first-mac second-mac))))
         (setf (symbol-function 'ironclad:make-mac) original-make-mac)))))
+
+;;; ---- AES-GCM ------------------------------------------------------------
+
+(defun pipe-buffer (pipe)
+  (slot-value pipe 'buffer))
+
+(define-test aes-gcm-roundtrip-keeps-direction-state-independent
+  :parent (:ssh/tests ssh/tests)
+  (let* ((pipe (make-pipe))
+         (ps (make-packet-stream pipe))
+         (key (octets 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15))
+         (iv (octets 16 17 18 19 20 21 22 23 24 25 26 27)))
+    (install-gcm-keys ps :key-out key :iv-out iv
+                         :key-in key :iv-in iv)
+    (send-packet ps (octets 94 1 2 3))
+    (send-packet ps (octets 94 4 5 6))
+    (is equalp (octets 94 1 2 3) (recv-packet ps))
+    (is equalp (octets 94 4 5 6) (recv-packet ps))
+    (is = 2 (ssh/packet:packet-stream-seq-out ps))
+    (is = 2 (ssh/packet:packet-stream-seq-in ps))))
+
+(define-test aes-gcm-wire-format-leaves-length-as-aad
+  :parent (:ssh/tests ssh/tests)
+  (let* ((pipe (make-pipe))
+         (ps (make-packet-stream pipe))
+         (key (make-array 16 :element-type '(unsigned-byte 8)
+                             :initial-element 0))
+         (iv (make-array 12 :element-type '(unsigned-byte 8)
+                            :initial-element 0)))
+    (install-gcm-keys ps :key-out key :iv-out iv)
+    (send-packet ps (octets 94 1 2 3 4))
+    (let* ((wire (pipe-buffer pipe))
+           (packet-length (logior (ash (aref wire 0) 24)
+                                  (ash (aref wire 1) 16)
+                                  (ash (aref wire 2) 8)
+                                  (aref wire 3))))
+      (is = 0 (mod packet-length 16))
+      (is = (+ 4 packet-length 16) (length wire))
+      (is = (+ 4 packet-length 16)
+          (ssh/packet:packet-stream-bytes-out ps)))))
+
+(define-test aes-gcm-rejects-modified-ciphertext-and-tag
+  :parent (:ssh/tests ssh/tests)
+  (flet ((rejects-tampering-at (index-fn)
+           (let* ((pipe (make-pipe))
+                  (ps (make-packet-stream pipe))
+                  (key (make-array 16 :element-type '(unsigned-byte 8)
+                                      :initial-element 0))
+                  (iv (make-array 12 :element-type '(unsigned-byte 8)
+                                     :initial-element 0)))
+             (install-gcm-keys ps :key-out key :iv-out iv
+                                  :key-in key :iv-in iv)
+             (send-packet ps (octets 94 1 2 3))
+             (let* ((wire (pipe-buffer pipe))
+                    (index (funcall index-fn wire)))
+               (setf (aref wire index) (logxor (aref wire index) 1)))
+             (fail (recv-packet ps) 'ssh-protocol-error))))
+    (rejects-tampering-at (lambda (wire)
+                            (declare (ignore wire))
+                            4))
+    (rejects-tampering-at (lambda (wire)
+                            (1- (length wire))))))
+
+(define-test aes-gcm-invocation-counter-carries-and-refuses-reuse
+  :parent (:ssh/tests ssh/tests)
+  (let* ((key (make-array 16 :element-type '(unsigned-byte 8)
+                             :initial-element 0))
+         (iv (octets 1 2 3 4 0 0 0 0 0 0 255 255))
+         (protection (ssh/packet::make-gcm-protection
+                      :key key :iv (copy-seq iv))))
+    (is equalp iv (ssh/packet::reserve-gcm-iv protection))
+    (is equalp (octets 1 2 3 4 0 0 0 0 0 1 0 0)
+        (ssh/packet::reserve-gcm-iv protection)))
+  (let* ((key (make-array 16 :element-type '(unsigned-byte 8)
+                             :initial-element 0))
+         (iv (octets 1 2 3 4 255 255 255 255 255 255 255 255))
+         (protection (ssh/packet::make-gcm-protection
+                      :key key :iv (copy-seq iv))))
+    (is equalp iv (ssh/packet::reserve-gcm-iv protection))
+    (fail (ssh/packet::reserve-gcm-iv protection)
+        'ssh-protocol-error)))

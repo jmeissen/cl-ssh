@@ -71,6 +71,10 @@
    #:+host-key-rsa-sha2-512+
    #:+cipher-aes128-ctr+
    #:+cipher-aes256-ctr+
+   #:+cipher-aes128-gcm-openssh+
+   #:+cipher-aes256-gcm-openssh+
+   #:+aead-aes128-gcm+
+   #:+aead-aes256-gcm+
    #:+mac-hmac-sha2-256+
    #:+mac-hmac-sha2-512+
    #:+compression-none+
@@ -178,6 +182,10 @@
 (defparameter +host-key-rsa-sha2-512+       "rsa-sha2-512")
 (defparameter +cipher-aes128-ctr+           "aes128-ctr")
 (defparameter +cipher-aes256-ctr+           "aes256-ctr")
+(defparameter +cipher-aes128-gcm-openssh+   "aes128-gcm@openssh.com")
+(defparameter +cipher-aes256-gcm-openssh+   "aes256-gcm@openssh.com")
+(defparameter +aead-aes128-gcm+             "AEAD_AES_128_GCM")
+(defparameter +aead-aes256-gcm+             "AEAD_AES_256_GCM")
 (defparameter +mac-hmac-sha2-256+           "hmac-sha2-256")
 (defparameter +mac-hmac-sha2-512+           "hmac-sha2-512")
 (defparameter +compression-none+            "none")
