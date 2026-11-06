@@ -44,7 +44,6 @@ qlot add ultralisp jmeissen-cl-ssh
 - [babel](https://github.com/cl-babel/babel) - UTF-8 string to octet support
 - [Bordeaux Threads](https://github.com/sionescu/bordeaux-threads) - portable threads, locks, and conditions
 - [Nibbles](https://github.com/sharplispers/nibbles) - endian-aware octet-vector access
-Qlot manages project-local dependencies; it is not needed at runtime.
 
 ## Usage
 
@@ -120,7 +119,7 @@ Or, try a dumb interactive shell from your REPL. When done playing, type `exit<R
       until exiting)))
 ```
 
-#### Streams, stderr, and PTY
+#### Advanced shell: streams, stderr, and PTY
 
 `ssh:open-shell` and `ssh:open-subsystem` return
 `(values stream channel stderr-stream)`: a bidirectional binary stream and
@@ -160,7 +159,7 @@ Normal stream close sends EOF/CLOSE and waits for the peer's CLOSE.
 `(close stream :abort t)` sends CLOSE without waiting and wakes blocked readers
 with failure.
 
-### File transfers
+### File transfers (SFTP)
 
 #### Single-file copies
 
@@ -192,7 +191,7 @@ Existing files are replaced by default; `:if-exists :error` rejects replacement.
 Remote paths go directly to SFTP, without shell interpolation, wildcard or
 tilde expansion.
 
-#### SFTP sessions and transfers
+#### Sessions and transfers
 
 Use `ssh:with-sftp` to perform several operations on an existing connection:
 
@@ -268,7 +267,7 @@ Closing an SFTP session normally flushes and closes its owned file streams.
 > as it will constitute major version changes since it breaks the public API,
 > I'll probably bundle the improvements all together and release at once.
 
-#### Operations, paths, and extensions
+#### Advanced SFTP: Operations, paths, and extensions
 
 The API provides file/handle open and close, `sftp-read-at` and `sftp-write-at`,
 directory open/read/list, stat/lstat/fstat, setstat/fsetstat,
