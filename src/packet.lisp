@@ -18,6 +18,11 @@
                 #:buffer-to-octets
                 #:make-read-buffer #:read-byte* #:read-uint32 #:read-raw-bytes
                 #:read-remaining-bytes)
+  (:import-from #:ssh/compression
+                #:make-compressor #:make-decompressor
+                #:compress-payload #:decompress-payload)
+  (:import-from #:ssh/constants
+                #:+compression-none+)
   (:export
    #:make-packet-stream
    #:packet-stream-socket-stream
@@ -27,10 +32,13 @@
    #:packet-stream-packets-in
    #:packet-stream-bytes-out
    #:packet-stream-bytes-in
+   #:packet-stream-compression-out
+   #:packet-stream-compression-in
    #:send-packet
    #:recv-packet
    #:install-keys
    #:install-gcm-keys
+   #:install-compression
    #:ssh-protocol-error))
 
 (in-package #:ssh/packet)
@@ -68,7 +76,10 @@
   (bytes-in    0 :type (integer 0 *))
   ;; Complete protection state is installed atomically per direction.
   (protection-out (make-classic-protection))
-  (protection-in  (make-classic-protection)))
+  (protection-in  (make-classic-protection))
+  ;; RFC 4253 compression history is also independent per direction.
+  (compression-out (make-compressor +compression-none+))
+  (compression-in  (make-decompressor +compression-none+)))
 
 (defun make-packet-stream (socket-stream)
   "Return a new packet-stream over SOCKET-STREAM in cleartext mode."
@@ -127,6 +138,18 @@ Returns PS."
     (when (or key-in iv-in)
       (setf (packet-stream-protection-in ps)
             (make-protection key-in iv-in "inbound"))))
+  ps)
+
+(defun install-compression (ps &key (out nil out-p) (in nil in-p))
+  "Install fresh RFC 4253 compression contexts for selected directions.
+PS is the packet stream whose directional compression state is replaced.
+OUT is the client-to-server compression algorithm name.
+IN is the server-to-client compression algorithm name.
+Returns PS."
+  (when out-p
+    (setf (packet-stream-compression-out ps) (make-compressor out)))
+  (when in-p
+    (setf (packet-stream-compression-in ps) (make-decompressor in)))
   ps)
 
 (defun reserve-gcm-iv (protection)
@@ -257,14 +280,16 @@ PAYLOAD is an octet vector whose first byte is the SSH message type.
 Returns the sequence number used for this packet."
   (declare (type packet-stream ps)
            (type (vector (unsigned-byte 8)) payload))
-  (let* ((seq (packet-stream-seq-out ps))
+  (let* ((packet-payload
+           (compress-payload (packet-stream-compression-out ps) payload))
+         (seq (packet-stream-seq-out ps))
          (protection (packet-stream-protection-out ps))
          (wire-length
            (etypecase protection
              (classic-protection
-              (send-classic-packet ps protection payload seq))
+               (send-classic-packet ps protection packet-payload seq))
              (gcm-protection
-              (send-gcm-packet ps protection payload)))))
+               (send-gcm-packet ps protection packet-payload)))))
     (incf (packet-stream-packets-out ps))
     (incf (packet-stream-bytes-out ps) wire-length)
     (setf (packet-stream-seq-out ps) (ldb (byte 32 0) (1+ seq)))
@@ -290,31 +315,31 @@ Returns the sequence number used for this packet."
          (first-block (%read-octets stream bs)))
     (when cipher-in
       (ironclad:decrypt-in-place cipher-in first-block))
-    (let* ((pkt-length (octets-uint32 first-block))
-           (total (+ 4 pkt-length))
-           (remaining (- total bs))
-           ;; Full plaintext buffer
-           (plaintext (make-array total :element-type '(unsigned-byte 8))))
+    (let ((pkt-length (octets-uint32 first-block)))
       (validate-packet-length pkt-length)
-      (unless (and (>= total bs) (zerop (mod total bs)))
-        (error 'ssh-protocol-error :message "misaligned classic packet"))
-      ;; Copy already-decrypted first block
-      (replace plaintext first-block)
-      ;; Step 2: read and decrypt the rest
-      (when (plusp remaining)
-        (let ((rest (%read-octets stream remaining)))
-          (when cipher-in
-            (ironclad:decrypt-in-place cipher-in rest))
-          (replace plaintext rest :start1 bs)))
-      ;; Step 3: read and verify MAC
-      (when (plusp mac-len)
-        (let ((received-mac (%read-octets stream mac-len))
-              (expected-mac (funcall (classic-protection-mac protection)
-                                     seq plaintext)))
-          (unless (ironclad:constant-time-equal received-mac expected-mac)
-            (error 'ssh-protocol-error :message "MAC verification failed"))))
-      (values (extract-payload (subseq plaintext 4) pkt-length)
-              (+ total mac-len)))))
+      (let* ((total (+ 4 pkt-length))
+             (remaining (- total bs))
+             ;; Allocate only after validating the unauthenticated length field.
+             (plaintext (make-array total :element-type '(unsigned-byte 8))))
+        (unless (and (>= total bs) (zerop (mod total bs)))
+          (error 'ssh-protocol-error :message "misaligned classic packet"))
+        ;; Copy already-decrypted first block
+        (replace plaintext first-block)
+        ;; Step 2: read and decrypt the rest
+        (when (plusp remaining)
+          (let ((rest (%read-octets stream remaining)))
+            (when cipher-in
+              (ironclad:decrypt-in-place cipher-in rest))
+            (replace plaintext rest :start1 bs)))
+        ;; Step 3: read and verify MAC
+        (when (plusp mac-len)
+          (let ((received-mac (%read-octets stream mac-len))
+                (expected-mac (funcall (classic-protection-mac protection)
+                                       seq plaintext)))
+            (unless (ironclad:constant-time-equal received-mac expected-mac)
+              (error 'ssh-protocol-error :message "MAC verification failed"))))
+        (values (extract-payload (subseq plaintext 4) pkt-length)
+                (+ total mac-len))))))
 
 (defun recv-gcm-packet (ps protection)
   (let* ((stream (packet-stream-socket-stream ps))
@@ -353,7 +378,7 @@ Returns an octet vector whose first byte is the SSH message type."
       (incf (packet-stream-packets-in ps))
       (incf (packet-stream-bytes-in ps) wire-length)
       (setf (packet-stream-seq-in ps) (ldb (byte 32 0) (1+ seq)))
-      payload)))
+      (decompress-payload (packet-stream-compression-in ps) payload))))
 
 ;;;; MAC construction helper (used by transport to build MAC functions)
 

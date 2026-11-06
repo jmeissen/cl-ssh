@@ -100,18 +100,6 @@
      (read-string* buf)
      (read-string* buf))))
 
-(defun decode-publickey-signature-input (payload)
-  (let ((buf (make-read-buffer payload)))
-    (values
-     (read-string* buf)
-     (read-byte* buf)
-     (read-string* buf)
-     (octets->string (read-string* buf))
-     (octets->string (read-string* buf))
-     (read-boolean buf)
-     (octets->string (read-string* buf))
-     (read-string* buf))))
-
 (defun decode-info-response (payload)
   (let ((buf (make-read-buffer payload)))
     (let ((message-type (read-byte* buf))
@@ -202,53 +190,172 @@
       (is string= "" language-tag)
       (is string= "" submethods))))
 
-(define-test publickey-auth-encodes-username-as-utf8-in-request-and-signature-input
+(define-test publickey-signatures-cover-transmitted-request
   :parent (:ssh/tests ssh/tests)
-  (multiple-value-bind (private public)
-      (ironclad:generate-key-pair :ed25519)
-    (let ((key-info (list :type "ssh-ed25519"
-                          :private-key private
-                          :public-key public))
-          (session-id (ssh/tests:octets 9 8 7))
-          (signature-blob (ssh/tests:octets #xde #xad 0 #xff))
-          (auth-data nil)
-          (original-sign (symbol-function 'ssh/keys:sign-auth-data)))
-      (unwind-protect
-           (progn
-             (setf (symbol-function 'ssh/keys:sign-auth-data)
-                   (lambda (_key-info data &key algorithm)
-                     (declare (ignore _key-info algorithm))
-                     (setf auth-data data)
-                     signature-blob))
+  (dolist (fixture '("id_ed25519_nopass" "id_rsa_nopass"))
+    (let ((key-info (ssh/keys:load-private-key
+                     (asdf:system-relative-pathname
+                      :ssh (format nil "tests/fixtures/keys/~A" fixture))))
+          (session-id (ssh/tests:octets 9 8 7)))
+      (multiple-value-bind (result sent)
+          (run-with-mocked-auth-io
+           (list (build-userauth-success))
+           (lambda (transport)
+             (setf (ssh/transport:transport-session-id transport) session-id)
+             (ssh/auth::try-publickey transport "ålîçé" key-info)))
+        (true result)
+        (is = 1 (length sent))
+        (multiple-value-bind (type username service method signed-p algorithm key-blob signature)
+            (decode-publickey-request (first sent))
+          (is = +msg-userauth-request+ type)
+          (is equalp (utf-8-to-octets "ålîçé") username)
+          (is string= +service-connection+ service)
+          (is string= +auth-publickey+ method)
+          (true signed-p)
+          (let ((signed-data (make-write-buffer)))
+            (write-string* signed-data session-id)
+            (ssh/buffer:write-raw-bytes
+             signed-data (first sent) :end (- (length (first sent)) 4 (length signature)))
+            (let ((bytes (buffer-to-octets signed-data)))
+              (true (progn
+                      (ssh/keys:verify-host-key-signature algorithm key-blob bytes signature)
+                      t))
+              (setf (aref bytes (1- (length bytes)))
+                    (logxor 1 (aref bytes (1- (length bytes)))))
+              (fail (ssh/keys:verify-host-key-signature algorithm key-blob bytes signature)
+                    'ssh/keys:key-error))))))))
+
+(define-test publickey-probe-encodes-unsigned-request
+  :parent (:ssh/tests ssh/tests)
+  (let ((key-info (ssh/keys:load-private-key
+                   (asdf:system-relative-pathname :ssh "tests/fixtures/keys/id_rsa_nopass"))))
+    (dolist (reply (list (ssh/tests:octets ssh/constants:+msg-userauth-pk-ok+)
+                        (build-userauth-failure)))
+      (multiple-value-bind (result sent)
+          (run-with-mocked-auth-io
+           (list reply)
+           (lambda (transport) (ssh/auth::probe-publickey transport "ålîçé" key-info)))
+        (is eql (= (aref reply 0) ssh/constants:+msg-userauth-pk-ok+) result)
+        (is = 1 (length sent))
+        (let ((buf (make-read-buffer (first sent))))
+          (is = +msg-userauth-request+ (read-byte* buf))
+          (is equalp (utf-8-to-octets "ålîçé") (read-string* buf))
+          (is string= +service-connection+ (octets->string (read-string* buf)))
+          (is string= +auth-publickey+ (octets->string (read-string* buf)))
+          (false (read-boolean buf))
+          (is string= "rsa-sha2-512" (octets->string (read-string* buf)))
+          (let ((key-buf (make-read-buffer (read-string* buf))))
+            (is string= "ssh-rsa" (octets->string (read-string* key-buf)))
+            (is = (ironclad:rsa-key-exponent (getf key-info :public-key))
+                (ssh/buffer:read-mpint key-buf))
+            (is = (ironclad:rsa-key-modulus (getf key-info :public-key))
+                (ssh/buffer:read-mpint key-buf))
+            (is = 0 (ssh/buffer:read-remaining-bytes key-buf)))
+          (is = 0 (ssh/buffer:read-remaining-bytes buf)))))))
+
+(define-test rsa-publickey-auth-retries-legacy-sha1-only-with-the-feature
+  :parent (:ssh/tests ssh/tests)
+  (let* ((key-info (ssh/keys:load-private-key
+                    (asdf:system-relative-pathname
+                     :ssh "tests/fixtures/keys/id_rsa_nopass")))
+         (original-sign (symbol-function 'ssh/keys:sign-auth-data)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'ssh/keys:sign-auth-data)
+                 (lambda (_key-info _data &key algorithm)
+                   (declare (ignore _key-info _data algorithm))
+                   (ssh/tests:octets #x01)))
+           (let ((*features* (cons :cl-ssh-legacy-rsa-sha1 *features*)))
              (multiple-value-bind (result sent)
                  (run-with-mocked-auth-io
-                  (list (build-userauth-success))
+                  (list (build-userauth-failure)
+                        (build-userauth-success))
                   (lambda (transport)
-                    (setf (ssh/transport:transport-session-id transport) session-id)
-                    (ssh/auth::try-publickey transport "ålîçé" key-info)))
+                    (setf (ssh/transport:transport-session-id transport)
+                          (ssh/tests:octets 1 2 3))
+                    (ssh/auth::try-publickey transport "alice" key-info)))
                (true result)
-               (is = 1 (length sent))
-               (multiple-value-bind (message-type username service method signed-p algorithm pk-blob sent-signature)
+               (is = 2 (length sent))
+               (multiple-value-bind (_type _user _service _method _signed-p first-algorithm)
                    (decode-publickey-request (first sent))
-                 (is = +msg-userauth-request+ message-type)
-                 (is equalp (utf-8-to-octets "ålîçé") username)
-                 (is string= +service-connection+ service)
-                 (is string= +auth-publickey+ method)
-                 (true signed-p)
-                 (is string= "ssh-ed25519" algorithm)
-                 (true (> (length pk-blob) 0))
-                 (is equalp signature-blob sent-signature))
-               (multiple-value-bind (signed-session-id message-type username service method signed-p algorithm pk-blob)
-                   (decode-publickey-signature-input auth-data)
-                 (is equalp session-id signed-session-id)
-                 (is = +msg-userauth-request+ message-type)
-                 (is equalp (utf-8-to-octets "ålîçé") username)
-                 (is string= +service-connection+ service)
-                 (is string= +auth-publickey+ method)
-                 (true signed-p)
-                 (is string= "ssh-ed25519" algorithm)
-                 (true (> (length pk-blob) 0)))))
-        (setf (symbol-function 'ssh/keys:sign-auth-data) original-sign)))))
+                 (declare (ignore _type _user _service _method _signed-p))
+                 (is string= "rsa-sha2-512" first-algorithm))
+               (multiple-value-bind (_type _user _service _method _signed-p second-algorithm)
+                   (decode-publickey-request (second sent))
+                 (declare (ignore _type _user _service _method _signed-p))
+                 (is string= "ssh-rsa" second-algorithm)))))
+      (setf (symbol-function 'ssh/keys:sign-auth-data) original-sign))))
+
+(define-test rsa-publickey-legacy-fallback-preserves-partial-success
+  :parent (:ssh/tests ssh/tests)
+  (let ((key-info (ssh/keys:load-private-key
+                   (asdf:system-relative-pathname
+                    :ssh "tests/fixtures/keys/id_rsa_nopass")))
+        (*features* (cons :cl-ssh-legacy-rsa-sha1 *features*)))
+    (dolist (methods '(("keyboard-interactive")
+                       ("publickey" "keyboard-interactive")))
+      (let ((captured-condition nil))
+        (multiple-value-bind (result sent)
+            (run-with-mocked-auth-io
+             (list (build-userauth-failure :methods methods :partial t)
+                   (build-info-request :prompts '(("OTP" . nil)))
+                   (build-userauth-success))
+             (lambda (transport)
+               (setf (ssh/transport:transport-session-id transport)
+                     (ssh/tests:octets 1 2 3))
+               (handler-case
+                   (handler-bind
+                       ((ssh/auth:auth-partial-success
+                          (lambda (condition)
+                            (setf captured-condition condition)
+                            (invoke-restart
+                             'ssh/auth::continue-authentication
+                             "keyboard-interactive"
+                             (lambda (name instruction language-tag prompts)
+                               (declare (ignore name instruction language-tag))
+                               (is equal '((:prompt "OTP" :echo nil)) prompts)
+                               '("000000"))))))
+                     (ssh/auth::try-publickey transport "alice" key-info))
+                 (auth-error (condition) condition))))
+          (is eql t result)
+          (true captured-condition)
+          (when captured-condition
+            (is string= "publickey"
+                (ssh/auth:auth-partial-success-attempted-method captured-condition))
+            (is equal methods
+                (ssh/auth:auth-partial-success-allowed-methods captured-condition))
+            (true (ssh/auth:auth-partial-success-partial-success-p captured-condition)))
+          (is = 3 (length sent))
+          (is string= "rsa-sha2-512"
+              (nth-value 5 (decode-publickey-request (first sent))))
+          (let ((buffer (make-read-buffer (second sent))))
+            (is = +msg-userauth-request+ (read-byte* buffer))
+            (read-string* buffer)
+            (read-string* buffer)
+            (is string= "keyboard-interactive"
+                (octets->string (read-string* buffer)))))))))
+
+(define-test rsa-publickey-legacy-fallback-requires-publickey-continuation
+  :parent (:ssh/tests ssh/tests)
+  (let ((key-info (ssh/keys:load-private-key
+                   (asdf:system-relative-pathname
+                    :ssh "tests/fixtures/keys/id_rsa_nopass")))
+        (*features* (cons :cl-ssh-legacy-rsa-sha1 *features*)))
+    (dolist (methods '(("keyboard-interactive") ("password") ()))
+      (multiple-value-bind (result sent)
+          (run-with-mocked-auth-io
+           (list (build-userauth-failure :methods methods)
+                 (build-userauth-success))
+           (lambda (transport)
+             (setf (ssh/transport:transport-session-id transport)
+                   (ssh/tests:octets 1 2 3))
+             (handler-case
+                 (ssh/auth::try-publickey transport "alice" key-info)
+               (auth-error (condition) condition))))
+        (of-type 'auth-error result)
+        (is = 1 (length sent))
+        (is string= "rsa-sha2-512"
+            (nth-value 5 (decode-publickey-request (first sent))))))))
 
 (define-test keyboard-interactive-parse-info-request
   :parent (:ssh/tests ssh/tests)
@@ -404,7 +511,8 @@
          (output (make-string-output-stream))
          (callback (make-keyboard-interactive-cli-callback
                     :input input
-                    :output output)))
+                    :output output
+                    :no-echo-reader #'read-line)))
     (is equal '("first" "second")
         (funcall callback
                  "Challenge"
@@ -413,7 +521,7 @@
                  '((:prompt "Password:" :echo nil)
                    (:prompt "OTP:" :echo t))))
     (is string=
-        (format nil "Challenge~%Enter the codes~%Password: [hidden] OTP: ")
+        (format nil "Challenge~%Enter the codes~%Password:OTP:")
         (get-output-stream-string output))))
 
 (define-test keyboard-interactive-cli-helper-preserves-response-order
@@ -422,7 +530,8 @@
          (output (make-string-output-stream))
          (callback (make-keyboard-interactive-cli-callback
                     :input input
-                    :output output)))
+                    :output output
+                    :no-echo-reader #'read-line)))
     (is equal '("one" "two" "three")
         (funcall callback
                  ""
@@ -438,7 +547,8 @@
          (output (make-string-output-stream))
          (callback (make-keyboard-interactive-cli-callback
                     :input input
-                    :output output)))
+                    :output output
+                    :no-echo-reader #'read-line)))
     (is equal '("")
         (funcall callback
                  ""
@@ -474,6 +584,43 @@
                      (:prompt "Secret:" :echo nil))))
       (is equal '(:hidden :visible)
           calls))))
+
+(define-test keyboard-interactive-cli-refuses-unmasked-secret-input
+  :parent (:ssh/tests ssh/tests)
+  (let* ((calls 0)
+         (output (make-string-output-stream))
+         (callback (make-keyboard-interactive-cli-callback
+                    :output output
+                    :reader (lambda (stream)
+                              (declare (ignore stream))
+                              (incf calls)
+                              "secret"))))
+    (fail (funcall callback "" "" ""
+                   '((:prompt "Password:" :echo nil)))
+          'auth-error)
+    (is = 0 calls)
+    (is string= "" (get-output-stream-string output))))
+
+(define-test keyboard-interactive-cli-filters-terminal-controls
+  :parent (:ssh/tests ssh/tests)
+  (let* ((output (make-string-output-stream))
+         (callback (make-keyboard-interactive-cli-callback
+                    :input (make-string-input-stream (format nil "réponse~%"))
+                    :output output))
+         (esc (code-char 27)))
+    (is equal '("réponse")
+        (funcall callback
+                 (format nil "~C[2JName" esc)
+                 (format nil "First~%Second~Coverwrite" #\Return)
+                 ""
+                 (list (list :prompt (format nil "Code~C~C:" (code-char 7) (code-char 155))
+                             :echo t))))
+    (let ((display (get-output-stream-string output)))
+      (false (some (lambda (char) (or (< (char-code char) 32)
+                                     (<= 127 (char-code char) 159)))
+                   (remove #\Newline display)))
+      (true (search (format nil "First~%Second") display))
+      (false (search "[hidden]" display)))))
 
 (define-test keyboard-interactive-failure-and-unexpected-message
   :parent (:ssh/tests ssh/tests)

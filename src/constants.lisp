@@ -14,6 +14,7 @@
    #:+msg-kexinit+
    #:+msg-newkeys+
    #:+msg-ext-info+
+   #:+msg-newcompress+
    ;; KEX ECDH — curve25519-sha256 and generic ECDH (RFC 5656)
    #:+msg-kex-ecdh-init+
    #:+msg-kex-ecdh-reply+
@@ -78,8 +79,11 @@
    #:+mac-hmac-sha2-256+
    #:+mac-hmac-sha2-512+
    #:+compression-none+
+   #:+compression-zlib+
+   #:+compression-zlib-openssh+
    #:+ext-info-c+
    #:+ext-info-s+
+   #:+extension-delay-compression+
    ;; Service names
    #:+service-userauth+
    #:+service-connection+
@@ -113,6 +117,7 @@
 (defconstant +msg-kexinit+        20)
 (defconstant +msg-newkeys+        21)
 (defconstant +msg-ext-info+        7)
+(defconstant +msg-newcompress+     8)
 
 ;;; KEX ECDH messages (RFC 5656 §7.1; used for curve25519-sha256 too)
 (defconstant +msg-kex-ecdh-init+  30)
@@ -189,8 +194,11 @@
 (defparameter +mac-hmac-sha2-256+           "hmac-sha2-256")
 (defparameter +mac-hmac-sha2-512+           "hmac-sha2-512")
 (defparameter +compression-none+            "none")
+(defparameter +compression-zlib+            "zlib")
+(defparameter +compression-zlib-openssh+    "zlib@openssh.com")
 (defparameter +ext-info-c+                  "ext-info-c")
 (defparameter +ext-info-s+                  "ext-info-s")
+(defparameter +extension-delay-compression+ "delay-compression")
 
 ;;; Service names
 (defparameter +service-userauth+   "ssh-userauth")

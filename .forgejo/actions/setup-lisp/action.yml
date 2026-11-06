@@ -1,0 +1,120 @@
+name: Set up Common Lisp for Forgejo
+description: Install the Linux Common Lisp toolchain without resolving Windows-only nested actions.
+
+inputs:
+  cache-suffix:
+    description: Increment to invalidate the Common Lisp toolchain cache.
+    required: false
+    default: v1
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare toolchain cache
+      id: cache-key
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo mkdir -p /usr/local/etc/roswell
+        sudo chown "${USER}" /usr/local/etc/roswell /usr/local/bin
+        echo "month=$(date -u '+%Y-%m')" >> "${GITHUB_OUTPUT}"
+
+    - name: Restore Common Lisp toolchain
+      id: toolchain-cache
+      uses: https://data.forgejo.org/actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          ~/.quicklisp-client-fix
+          ~/.roswell
+          ~/.cache/common-lisp
+          /usr/local/etc/roswell
+          /usr/local/bin/ros
+          .qlot
+        key: forgejo-lisp-${{ steps.cache-key.outputs.month }}-${{ runner.os }}-${{ runner.arch }}-${{ env.LISP }}-${{ hashFiles('qlfile', 'qlfile.lock', '*.asd') }}-${{ inputs.cache-suffix }}
+
+    - name: Install Common Lisp toolchain
+      if: steps.toolchain-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        sudo apt-get update
+        sudo apt-get -y install git build-essential automake libcurl4-openssl-dev
+
+        curl --fail --location --show-error \
+          https://raw.githubusercontent.com/roswell/roswell/0e7a2f1b6d9153f33edf1cc7b780825913a93618/scripts/install-for-ci.sh \
+          | bash -xeo pipefail
+
+        export PATH="${HOME}/.roswell/bin:${HOME}/.roswell/lisp/quicklisp/bin:${PATH}"
+
+        ros -e '(ql:update-all-dists :prompt nil)'
+
+        git clone --no-tags \
+          https://github.com/40ants/quicklisp-client-fix.git \
+          "${HOME}/.quicklisp-client-fix"
+        git -C "${HOME}/.quicklisp-client-fix" checkout --detach \
+          9ce546db5f4e8dd336c27741e6c004c5ea632f5c
+
+        mkdir -p "${HOME}/.roswell"
+        printf '%s\n' \
+          '(let ((fix-filename' \
+          '        (merge-pathnames' \
+          '         ".quicklisp-client-fix/quicklisp-fix.lisp"' \
+          '         (user-homedir-pathname))))' \
+          '  (when (probe-file fix-filename)' \
+          '    (handler-bind ((warning (function muffle-warning)))' \
+          '      (load fix-filename))))' \
+          >> "${HOME}/.roswell/init.lisp"
+
+        ros install asdf/3.3.5.3
+        ros install fukamachi/qlot/0.11.5
+
+    - name: Expose Common Lisp tools
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "${HOME}/.roswell/bin" >> "${GITHUB_PATH}"
+        echo "${HOME}/.roswell/lisp/quicklisp/bin" >> "${GITHUB_PATH}"
+        echo "${GITHUB_WORKSPACE}/.qlot/bin" >> "${GITHUB_PATH}"
+
+    - name: Ensure SBCL command is available
+      if: env.LISP == 'sbcl' || env.LISP == 'sbcl-bin'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v sbcl >/dev/null 2>&1; then
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes sbcl
+          else
+            apt-get update
+            apt-get install --yes sbcl
+          fi
+        fi
+
+    - name: Verify selected Lisp implementation
+      shell: bash
+      run: |
+        set -euo pipefail
+        export PATH="${HOME}/.roswell/bin:${HOME}/.roswell/lisp/quicklisp/bin:${PATH}"
+
+        case "${LISP:?LISP must select a Common Lisp implementation}" in
+          sbcl|sbcl-bin)
+            expected=SBCL
+            ;;
+          ecl)
+            expected=ECL
+            ;;
+          *)
+            echo "Unsupported LISP value: ${LISP}" >&2
+            exit 64
+            ;;
+        esac
+
+        EXPECTED_LISP="${expected}" ros -Q -e \
+          '(let ((expected (uiop:getenv "EXPECTED_LISP"))
+                 (actual (lisp-implementation-type)))
+             (unless (string-equal actual expected)
+               (error "Expected ~A for LISP=~A, got ~A." expected
+                      (uiop:getenv "LISP") actual))
+             (format t "Using ~A for LISP=~A.~%" actual (uiop:getenv "LISP")))'

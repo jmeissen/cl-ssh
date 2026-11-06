@@ -4,27 +4,27 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "127.0.0.1:2222:22"
+      - "${SSH_TEST_BIND_ADDRESS:-127.0.0.1}:2222:22"
   sshd-rsa-sha2-256:
     build:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "127.0.0.1:2223:22"
+      - "${SSH_TEST_BIND_ADDRESS:-127.0.0.1}:2223:22"
     command: ["-o", "PubkeyAcceptedAlgorithms=rsa-sha2-256"]
   sshd-ssh-rsa:
     build:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "127.0.0.1:2224:22"
+      - "${SSH_TEST_BIND_ADDRESS:-127.0.0.1}:2224:22"
     command: ["-o", "PubkeyAcceptedAlgorithms=ssh-rsa"]
   sshd-partial-success:
     build:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "127.0.0.1:2226:22"
+      - "${SSH_TEST_BIND_ADDRESS:-127.0.0.1}:2226:22"
     command:
       - "-o"
       - "KbdInteractiveAuthentication=yes"
@@ -41,7 +41,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "127.0.0.1:2225:22"
+      - "${SSH_TEST_BIND_ADDRESS:-127.0.0.1}:2225:22"
     command:
       - "-o"
       - "KbdInteractiveAuthentication=yes"
@@ -58,12 +58,16 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "127.0.0.1:2227:22"
-    command: ["-o", "Ciphers=aes256-gcm@openssh.com"]
+      - "${SSH_TEST_BIND_ADDRESS:-127.0.0.1}:2227:22"
+    command:
+      - "-o"
+      - "Ciphers=aes256-gcm@openssh.com"
+      - "-o"
+      - "Compression=yes"
   sshd-aes128-gcm:
     build:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "127.0.0.1:2228:22"
+      - "${SSH_TEST_BIND_ADDRESS:-127.0.0.1}:2228:22"
     command: ["-o", "Ciphers=aes128-gcm@openssh.com"]

@@ -86,6 +86,11 @@
           '(vector (unsigned-byte 8)))
   "DER AlgorithmIdentifier prefix for SHA-1 (15 bytes).")
 
+(defun legacy-rsa-sha1-enabled-p ()
+  "Return whether legacy RSA/SHA-1 signatures are enabled.
+Returns true when :CL-SSH-LEGACY-RSA-SHA1 is present in *FEATURES*."
+  (member :cl-ssh-legacy-rsa-sha1 *features*))
+
 (defparameter +sha256-der-prefix+
   (coerce '(#x30 #x31 #x30 #x0d #x06 #x09
             #x60 #x86 #x48 #x01 #x65 #x03 #x04 #x02 #x01
@@ -341,33 +346,37 @@ Returns a list (:algorithm <string> :bytes <octet-vector>)."
           '(vector (unsigned-byte 8))))
 
 (defun base64-decode (string)
-  "Decode a base64 STRING (standard alphabet) to a simple octet vector."
-  (let* ((clean  (remove-if (lambda (c) (member c '(#\Newline #\Return #\Space #\Tab)))
-                             string))
-         (len    (length clean))
-         (table  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
-         (output (make-array (* 3 (ceiling len 4)) :element-type '(unsigned-byte 8)
-                                                   :fill-pointer 0)))
-    (flet ((decode-char (c)
-             (if (char= c #\=)
-                 0
-                 (let ((pos (position c table)))
-                   (unless pos
-                     (error 'key-error :message (format nil "invalid base64 character ~S" c)))
-                   pos))))
-      (loop for i from 0 below len by 4
-            for c0 = (decode-char (char clean i))
-            for c1 = (decode-char (char clean (+ i 1)))
-            for c2 = (if (< (+ i 2) len) (decode-char (char clean (+ i 2))) 0)
-            for c3 = (if (< (+ i 3) len) (decode-char (char clean (+ i 3))) 0)
-            do (vector-push (logior (ash c0 2) (ash c1 -4)) output)
-               (unless (and (< (+ i 2) len) (char= (char clean (+ i 2)) #\=))
-                 (vector-push (logior (ash (logand c1 15) 4) (ash c2 -2)) output))
-               (unless (and (< (+ i 3) len) (char= (char clean (+ i 3)) #\=))
-                 (vector-push (logior (ash (logand c2 3) 6) c3) output))))
-    (let ((result (make-array (length output) :element-type '(unsigned-byte 8))))
-      (replace result output)
-      result)))
+  (let* ((clean (remove-if (lambda (c)
+                            (member c '(#\Newline #\Return #\Space #\Tab)))
+                          string))
+         (len (length clean))
+         (table "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"))
+    (unless (zerop (mod len 4))
+      (error 'key-error :message "incomplete base64 quartet in private key"))
+    (let ((output (make-array (* 3 (/ len 4)) :element-type '(unsigned-byte 8)
+                             :fill-pointer 0)))
+      (flet ((decode-char (c)
+               (or (position c table)
+                   (error 'key-error :message
+                          (format nil "invalid base64 character ~S" c)))))
+        (loop for i from 0 below len by 4
+              for c0 = (decode-char (char clean i))
+              for c1 = (decode-char (char clean (+ i 1)))
+              for pad2 = (char= (char clean (+ i 2)) #\=)
+              for pad3 = (char= (char clean (+ i 3)) #\=)
+              for c2 = (if pad2 0 (decode-char (char clean (+ i 2))))
+              for c3 = (if pad3 0 (decode-char (char clean (+ i 3))))
+              do (when (or (and pad2 (not pad3))
+                           (and (or pad2 pad3) (/= (+ i 4) len)))
+                   (error 'key-error :message "misplaced base64 padding in private key"))
+                 (vector-push (logior (ash c0 2) (ash c1 -4)) output)
+                 (unless pad2
+                   (vector-push (logior (ash (logand c1 15) 4) (ash c2 -2)) output))
+                 (unless pad3
+                   (vector-push (logior (ash (logand c2 3) 6) c3) output))))
+      (let ((result (make-array (length output) :element-type '(unsigned-byte 8))))
+        (replace result output)
+        result))))
 
 (defun parse-openssh-private-key (pem-string &key passphrase path)
   "Parse an OpenSSH new-format private key from PEM-STRING.
@@ -378,12 +387,19 @@ Returns a list (:algorithm <string> :bytes <octet-vector>)."
    KEY-NEEDS-PASSPHRASE with a SUPPLY-PASSPHRASE restart available.
    PATH is used solely for error reporting."
   (let* (;; Extract base64 between the PEM headers
-         (b64-start (+ (search "-----BEGIN OPENSSH PRIVATE KEY-----" pem-string)
-                       (length "-----BEGIN OPENSSH PRIVATE KEY-----")))
-         (b64-end   (search "-----END OPENSSH PRIVATE KEY-----" pem-string))
-         (b64       (subseq pem-string b64-start b64-end))
-         (raw       (base64-decode b64))
-         (buf       (make-read-buffer raw)))
+         (begin-marker "-----BEGIN OPENSSH PRIVATE KEY-----")
+         (end-marker   "-----END OPENSSH PRIVATE KEY-----")
+         (begin        (or (search begin-marker pem-string)
+                           (error 'key-error
+                                  :message "missing OpenSSH private-key begin marker")))
+         (end          (or (search end-marker pem-string
+                                   :start2 (+ begin (length begin-marker)))
+                           (error 'key-error
+                                  :message "missing OpenSSH private-key end marker")))
+         (b64-start   (+ begin (length begin-marker)))
+         (b64         (subseq pem-string b64-start end))
+         (raw         (base64-decode b64))
+         (buf         (make-read-buffer raw)))
     ;; Check magic: "openssh-key-v1\0"
     (let ((magic (ssh/buffer:read-raw-bytes buf (1+ (length +openssh-key-magic+)))))
       (unless (and (= (length magic) (1+ (length +openssh-key-magic+)))
@@ -485,7 +501,23 @@ Returns a list (:algorithm <string> :bytes <octet-vector>)."
    is signalled.  The restart SUPPLY-PASSPHRASE (string) is available.
 
    Returns a list (:type <string> :private-key <ironclad-key> :public-key <ironclad-key>)."
-  (let ((contents (uiop:read-file-string path)))
+  (let ((contents (with-open-file (stream path
+                                      :direction :input
+                                      :element-type '(unsigned-byte 8))
+                   (let* ((octets
+                            (make-array (file-length stream)
+                                        :element-type '(unsigned-byte 8)))
+                          (octet-count (read-sequence octets stream)))
+                     (handler-case
+                         (babel:octets-to-string octets
+                                                :encoding :utf-8
+                                                :end octet-count)
+                       (babel-encodings:character-decoding-error ()
+                         (error 'key-error
+                                :message
+                                (format nil
+                                        "private key file is not valid UTF-8: ~A"
+                                        path))))))))
     (cond
       ((search "BEGIN OPENSSH PRIVATE KEY" contents)
        (parse-openssh-private-key contents :passphrase passphrase :path path))
@@ -510,6 +542,10 @@ Returns a list (:algorithm <string> :bytes <octet-vector>)."
       ((or (string= key-type "ssh-rsa")
            (string= key-type +host-key-rsa-sha2-256+)
            (string= key-type +host-key-rsa-sha2-512+))
+        (when (and (string= key-type "ssh-rsa")
+                   (not (legacy-rsa-sha1-enabled-p)))
+          (error 'key-error
+                 :message "legacy ssh-rsa signing requires :CL-SSH-LEGACY-RSA-SHA1"))
         ;; Build PKCS1v1.5 EM and sign it
         (let* ((digest-name (cond ((string= key-type "ssh-rsa") :sha1)
                                   ((string= key-type +host-key-rsa-sha2-256+) :sha256)

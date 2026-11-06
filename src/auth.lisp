@@ -114,9 +114,7 @@
     ((listp submethods)
      (unless (every #'stringp submethods)
        (error 'auth-error :message "keyboard-interactive submethods must be strings"))
-     (if submethods
-         (format nil "~{~A~^,~}" submethods)
-         ""))
+     (format nil "~{~A~^,~}" submethods))
     (t
       (error 'auth-error :message "keyboard-interactive submethods must be NIL, a string, or a list of strings"))))
 
@@ -143,8 +141,13 @@
                (t
                 (write-char ch out))))))
 
-(defun write-username (buf username)
-  (write-string* buf (utf-8-to-octets username)))
+(defun make-auth-request-buffer (username method)
+  (let ((buf (make-write-buffer)))
+    (write-byte* buf +msg-userauth-request+)
+    (write-string* buf (utf-8-to-octets username))
+    (write-string* buf +service-connection+)
+    (write-string* buf method)
+    buf))
 
 (defun normalize-auth-method-name (method)
   (etypecase method
@@ -217,6 +220,16 @@
       (write-string* buf (utf-8-to-octets response)))
     (buffer-to-octets buf)))
 
+(defun terminal-safe-auth-text (text)
+  ;; Preserve UTF-8 text and line breaks, but render C0/C1 controls visibly.
+  (with-output-to-string (output)
+    (loop for char across text
+          for code = (char-code char)
+          do (if (or (and (< code 32) (not (char= char #\Newline)))
+                     (<= 127 code 159))
+                 (format output "\\x~2,'0X" code)
+                 (write-char char output)))))
+
 (defun make-keyboard-interactive-cli-callback (&key
                                                  (input *standard-input*)
                                                  (output *standard-output*)
@@ -224,39 +237,42 @@
                                                  no-echo-reader
                                                  (display-name-p t)
                                                  (display-instruction-p t)
-                                                 (prompt-suffix " ")
-                                                 (no-echo-suffix " [hidden] "))
+                                                 (prompt-suffix "")
+                                                 (no-echo-suffix ""))
   "Build a keyboard-interactive callback that reads answers from INPUT.
 
 INPUT is the stream passed to the response reader.
-OUTPUT is the stream that receives the server-supplied name, instruction, and prompt text.
+OUTPUT receives server text with terminal control characters escaped.
 READER is a callable for prompts whose :ECHO flag is true.
-NO-ECHO-READER is a callable for prompts whose :ECHO flag is false.
- If NO-ECHO-READER is NIL, READER is used for both prompt kinds.
+NO-ECHO-READER must read without terminal echo for prompts whose :ECHO flag is false.
+Without NO-ECHO-READER, a hidden prompt signals AUTH-ERROR before any input is read.
 DISPLAY-NAME-P controls whether NAME is printed when it is non-empty.
 DISPLAY-INSTRUCTION-P controls whether INSTRUCTION is printed when it is non-empty.
 PROMPT-SUFFIX is appended after echoed prompts.
 NO-ECHO-SUFFIX is appended after prompts whose :ECHO flag is false.
 
 Returns a function of (name instruction language-tag prompts) that returns a list of response strings."
-  (let ((silent-reader (or no-echo-reader reader)))
-    (lambda (name instruction language-tag prompts)
+  (lambda (name instruction language-tag prompts)
       (declare (ignore language-tag))
+      (when (and (null no-echo-reader)
+                 (some (lambda (prompt) (not (getf prompt :echo))) prompts))
+        (error 'auth-error :message "Hidden prompts require a secure :NO-ECHO-READER"))
       (when (and display-name-p (plusp (length name)))
-        (format output "~A~%" name))
+        (format output "~A~%" (terminal-safe-auth-text name)))
       (when (and display-instruction-p (plusp (length instruction)))
-        (format output "~A~%" instruction))
+        (format output "~A~%" (terminal-safe-auth-text instruction)))
       (loop for prompt in prompts
             collect (let* ((prompt-text (getf prompt :prompt))
                            (echo-p (getf prompt :echo))
                            (suffix (if echo-p prompt-suffix no-echo-suffix))
-                           (prompt-reader (if echo-p reader silent-reader)))
-                      (format output "~A~A" prompt-text suffix)
+                           (prompt-reader (if echo-p reader no-echo-reader)))
+                      (format output "~A~A" (terminal-safe-auth-text prompt-text) suffix)
                       (finish-output output)
                       (multiple-value-bind (response eof-p)
                           (funcall prompt-reader input)
-                        (declare (ignore eof-p))
-                        response))))))
+                        (when (or eof-p (not (stringp response)))
+                          (error 'auth-error :message "Authentication input ended without a response"))
+                        response)))))
 
 (defun rsa-key-type-p (key-type)
   (or (string= key-type "ssh-rsa")
@@ -268,11 +284,16 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
       "ssh-rsa"
       key-type))
 
+(defun legacy-rsa-sha1-enabled-p ()
+  "Return whether legacy RSA/SHA-1 client authentication is enabled.
+Returns true when :CL-SSH-LEGACY-RSA-SHA1 is present in *FEATURES*."
+  (member :cl-ssh-legacy-rsa-sha1 *features*))
+
 (defun select-publickey-signature-algorithm (transport key-info)
   "Select the best client-auth signature algorithm for KEY-INFO.
 
-   RSA keys use server-sig-algs when available and otherwise fall back to the
-   legacy ssh-rsa signature.
+   RSA keys prefer RSA/SHA-2.  The legacy ssh-rsa RSA/SHA-1 signature is
+   available only when :CL-SSH-LEGACY-RSA-SHA1 is present in *FEATURES*.
 
    Returns the algorithm name string to place in SSH_MSG_USERAUTH_REQUEST."
   (let ((key-type (getf key-info :type)))
@@ -282,18 +303,22 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
       ((rsa-key-type-p key-type)
        (let ((server-sig-algs (ssh/transport::transport-server-sig-algs transport)))
          (cond
+           ;; RFC 8332 requires clients to try RSA/SHA-2 even when the peer
+           ;; did not send server-sig-algs.  A failed attempt can subsequently
+           ;; use the explicitly enabled compatibility fallback.
            ((null server-sig-algs)
-             "ssh-rsa")
+            +host-key-rsa-sha2-512+)
            ((member +host-key-rsa-sha2-512+ server-sig-algs :test #'string=)
             +host-key-rsa-sha2-512+)
            ((member +host-key-rsa-sha2-256+ server-sig-algs :test #'string=)
             +host-key-rsa-sha2-256+)
-           ((member "ssh-rsa" server-sig-algs :test #'string=)
+           ((and (legacy-rsa-sha1-enabled-p)
+                 (member "ssh-rsa" server-sig-algs :test #'string=))
             "ssh-rsa")
            (t
             (error 'auth-error
                    :message (format nil
-                                    "server-sig-algs does not permit RSA authentication; server allows: ~{~A~^, ~}"
+                                    "server-sig-algs does not permit RSA/SHA-2 authentication; server allows: ~{~A~^, ~}"
                                     server-sig-algs))))))
       (t
        (error 'auth-error
@@ -304,11 +329,7 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
 (defun try-none (transport username)
   "Send a 'none' auth request and return the list of allowed methods on failure,
    or :success if the server (unusually) accepts it."
-  (let ((buf (make-write-buffer)))
-    (write-byte*   buf +msg-userauth-request+)
-    (write-username buf username)
-    (write-string* buf +service-connection+)
-    (write-string* buf +auth-none+)
+  (let ((buf (make-auth-request-buffer username +auth-none+)))
     (transport-send transport (buffer-to-octets buf)))
   (let ((reply (recv-auth-response transport)))
     (case (aref reply 0)
@@ -323,11 +344,7 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
 
 (defun try-password (transport username password)
   "Attempt password authentication (RFC 4252 §8)."
-  (let ((buf (make-write-buffer)))
-    (write-byte*   buf +msg-userauth-request+)
-    (write-username buf username)
-    (write-string* buf +service-connection+)
-    (write-string* buf +auth-password+)
+  (let ((buf (make-auth-request-buffer username +auth-password+)))
     (write-boolean buf nil)           ; FALSE — not a password-change request
     (write-string* buf (utf-8-to-octets password))
     (transport-send transport (buffer-to-octets buf)))
@@ -344,31 +361,10 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
                                  (aref reply 0)))))))
 
 (defun probe-publickey (transport username key-info)
-  "Send a publickey probe (no signature) to check whether the server will
-   accept this key.  Returns T if the key is acceptable."
-  (let* ((key-type   (getf key-info :type))
-         (algorithm  (select-publickey-signature-algorithm transport key-info))
-         (public-key (getf key-info :public-key))
-         ;; Build the public key blob
-         (pk-buf     (make-write-buffer)))
-    ;; Encode the public key in SSH wire format
-    (write-string* pk-buf (public-key-format-name key-type))
-    (encode-public-key-into pk-buf key-type public-key)
-    (let* ((pk-blob (buffer-to-octets pk-buf))
-            (req-buf (make-write-buffer)))
-      (write-byte*   req-buf +msg-userauth-request+)
-      (write-username req-buf username)
-      (write-string* req-buf +service-connection+)
-      (write-string* req-buf +auth-publickey+)
-      (write-boolean req-buf nil)         ; FALSE — probe, no signature
-      (write-string* req-buf algorithm)
-      (write-string* req-buf pk-blob)
-      (transport-send transport (buffer-to-octets req-buf)))
-    (let ((reply (recv-auth-response transport)))
-      (case (aref reply 0)
-        (#.+msg-userauth-pk-ok+  t)
-        (#.+msg-userauth-failure+ nil)
-        (t nil)))))
+  (let* ((algorithm (select-publickey-signature-algorithm transport key-info))
+         (buf (make-publickey-request-buffer username key-info algorithm nil)))
+    (transport-send transport (buffer-to-octets buf)))
+  (= (aref (recv-auth-response transport) 0) +msg-userauth-pk-ok+))
 
 (defun encode-public-key-into (buf key-type public-key)
   "Write the inner public-key fields into BUF for the given KEY-TYPE.
@@ -377,9 +373,7 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
     ((string= key-type "ssh-ed25519")
      (let ((y (ironclad:ed25519-key-y public-key)))
        (write-string* buf y)))
-    ((or (string= key-type "rsa-sha2-256")
-         (string= key-type "rsa-sha2-512")
-         (string= key-type "ssh-rsa"))
+    ((rsa-key-type-p key-type)
      ;; RSA wire format: string(key-type) mpint(e) mpint(n)
      ;; The key-type string is already written by the caller; here we add e and n.
      (let ((e (ironclad:rsa-key-exponent public-key))
@@ -389,50 +383,64 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
     (t
      (error 'auth-error :message (format nil "unsupported public key type: ~S" key-type)))))
 
+(defun make-publickey-request-buffer (username key-info algorithm signed-p)
+  (let* ((key-type (getf key-info :type))
+         (pk-buf (make-write-buffer))
+         (req-buf (make-auth-request-buffer username +auth-publickey+)))
+    (write-string* pk-buf (public-key-format-name key-type))
+    (encode-public-key-into pk-buf key-type (getf key-info :public-key))
+    (write-boolean req-buf signed-p)
+    (write-string* req-buf algorithm)
+    (write-string* req-buf (buffer-to-octets pk-buf))
+    req-buf))
+
+(defun send-publickey-request (transport username key-info algorithm)
+  (let ((req-buf (make-publickey-request-buffer username key-info algorithm t))
+        (sign-buf (make-write-buffer)))
+    ;; RFC 4252 §7: sign the session identifier followed by the exact request.
+    (write-string* sign-buf (transport-session-id transport))
+    (write-raw-bytes sign-buf (buffer-to-octets req-buf))
+    (write-string* req-buf
+                   (sign-auth-data key-info (buffer-to-octets sign-buf)
+                                   :algorithm algorithm))
+    (transport-send transport (buffer-to-octets req-buf)))
+  (recv-auth-response transport))
+
+(defun handle-publickey-reply (transport username reply)
+  "Interpret REPLY to one public-key request."
+  (case (aref reply 0)
+    (#.+msg-userauth-success+ t)
+    (#.+msg-userauth-failure+
+     (multiple-value-bind (methods partial) (parse-failure reply)
+       (handle-auth-failure +auth-publickey+ methods partial
+                            (lambda (method args)
+                              (continue-authentication-with-method transport username method args methods)))))
+    (t (error 'auth-error
+              :message (format nil "unexpected message ~D during publickey auth"
+                               (aref reply 0))))))
+
+(defun legacy-rsa-sha1-fallback-p (transport key-info reply)
+  "Return whether REPLY permits an opt-in legacy RSA/SHA-1 retry."
+  (and (legacy-rsa-sha1-enabled-p)
+       (rsa-key-type-p (getf key-info :type))
+       ;; An explicit server-sig-algs list is authoritative.  We only learn
+       ;; that RSA/SHA-2 is unavailable from a failed RSA/SHA-2 request when
+       ;; the extension was absent.
+       (null (ssh/transport::transport-server-sig-algs transport))
+       (= (aref reply 0) +msg-userauth-failure+)
+       (multiple-value-bind (methods partial) (parse-failure reply)
+         ;; RFC 4252 section 5.1: partial success means this factor succeeded.
+         (and (not partial)
+              (auth-method-allowed-p +auth-publickey+ methods)))))
+
 (defun try-publickey (transport username key-info)
   "Attempt public-key authentication (RFC 4252 §7)."
-  (let* ((key-type   (getf key-info :type))
-         (algorithm  (select-publickey-signature-algorithm transport key-info))
-         (public-key (getf key-info :public-key))
-         (session-id (transport-session-id transport))
-         (pk-buf     (make-write-buffer)))
-    (write-string* pk-buf (public-key-format-name key-type))
-    (encode-public-key-into pk-buf key-type public-key)
-    (let* ((pk-blob (buffer-to-octets pk-buf))
-           (sign-buf (make-write-buffer)))
-      ;; string(session-id) byte(50) string(username) string(service)
-      ;; string("publickey") bool(true) string(algo) string(pk-blob)
-      (write-string* sign-buf session-id)
-      (write-byte* sign-buf +msg-userauth-request+)
-      (write-username sign-buf username)
-      (write-string* sign-buf +service-connection+)
-      (write-string* sign-buf +auth-publickey+)
-      (write-boolean sign-buf t)
-      (write-string* sign-buf algorithm)
-      (write-string* sign-buf pk-blob)
-      (let* ((auth-data (buffer-to-octets sign-buf))
-             (sig-blob  (sign-auth-data key-info auth-data :algorithm algorithm))
-             (req-buf   (make-write-buffer)))
-        (write-byte*   req-buf +msg-userauth-request+)
-        (write-username req-buf username)
-        (write-string* req-buf +service-connection+)
-        (write-string* req-buf +auth-publickey+)
-        (write-boolean req-buf t)
-        (write-string* req-buf algorithm)
-        (write-string* req-buf pk-blob)
-        (write-string* req-buf sig-blob)
-        (transport-send transport (buffer-to-octets req-buf))))
-    (let ((reply (recv-auth-response transport)))
-      (case (aref reply 0)
-        (#.+msg-userauth-success+ t)
-        (#.+msg-userauth-failure+
-         (multiple-value-bind (methods partial) (parse-failure reply)
-           (handle-auth-failure +auth-publickey+ methods partial
-                                (lambda (method args)
-                                  (continue-authentication-with-method transport username method args methods)))))
-        (t (error 'auth-error
-                  :message (format nil "unexpected message ~D during publickey auth"
-                                   (aref reply 0))))))))
+  (let* ((algorithm (select-publickey-signature-algorithm transport key-info))
+         (reply (send-publickey-request transport username key-info algorithm)))
+    (if (legacy-rsa-sha1-fallback-p transport key-info reply)
+        (handle-publickey-reply transport username
+                                (send-publickey-request transport username key-info "ssh-rsa"))
+        (handle-publickey-reply transport username reply))))
 
 (defun try-keyboard-interactive (transport username callback &key submethods)
   "Attempt keyboard-interactive authentication (RFC 4256)."
@@ -440,11 +448,7 @@ Returns a function of (name instruction language-tag prompts) that returns a lis
     (error 'auth-error :message "keyboard-interactive authentication requires a callback"))
   (unless (functionp callback)
     (error 'auth-error :message "keyboard-interactive callback must be a function"))
-  (let ((request-buf (make-write-buffer)))
-    (write-byte* request-buf +msg-userauth-request+)
-    (write-username request-buf username)
-    (write-string* request-buf +service-connection+)
-    (write-string* request-buf +auth-keyboard-interactive+)
+  (let ((request-buf (make-auth-request-buffer username +auth-keyboard-interactive+)))
     (write-string* request-buf "")
     (write-string* request-buf (normalize-submethods submethods))
     (transport-send transport (buffer-to-octets request-buf)))

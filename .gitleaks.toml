@@ -1,0 +1,11 @@
+title = "cl-ssh Gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Repository-owned SSH private keys used only by deterministic and Docker tests"
+targetRules = ["private-key"]
+paths = [
+  '''^tests/fixtures/keys/id_(ed25519_(aes128cbc|aes256ctr|nopass)|rsa_(aes256ctr|nopass))$''',
+]

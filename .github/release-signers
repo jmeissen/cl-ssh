@@ -1,0 +1,2 @@
+# Add the dedicated release public key in Git allowed-signers format:
+jeffrey@meissen.email ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGRNrGpyPjJn9lXEm91SNKC4xLjPfvJIdo2PvVjWZnOe cl-ssh release signing

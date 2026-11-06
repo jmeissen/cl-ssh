@@ -22,6 +22,8 @@
                 #:+mac-hmac-sha2-256+
                 #:+mac-hmac-sha2-512+
                 #:+compression-none+
+                #:+compression-zlib+
+                #:+compression-zlib-openssh+
                 #:+ext-info-c+)
   (:import-from #:ssh/buffer
                 #:make-write-buffer #:write-byte* #:write-uint32 #:write-raw-bytes
@@ -34,9 +36,13 @@
    #:+preferred-cipher+
    #:+preferred-mac+
    #:+preferred-compression+
+   #:+preferred-delay-compression+
    #:gcm-cipher-p
    #:kexinit-payload
    #:parse-kexinit
+   #:kexinit-kex-algorithms
+   #:kexinit-compression-algorithms-c2s
+   #:kexinit-compression-algorithms-s2c
    #:negotiate-algorithms
    #:negotiated-kex
    #:negotiated-host-key
@@ -80,8 +86,15 @@
   "Preferred MAC algorithms, most preferred first.")
 
 (defparameter +preferred-compression+
-  (list +compression-none+)
-  "Preferred compression algorithms (none only for now).")
+  (list +compression-zlib+
+        +compression-zlib-openssh+
+        +compression-none+)
+  "Preferred compression algorithms, most preferred first.")
+
+(defparameter +preferred-delay-compression+
+  (list +compression-zlib+
+        +compression-none+)
+  "RFC 8308 delayed compression algorithms, most preferred first.")
 
 (defparameter +preferred-classic-mac+
   (list +mac-hmac-sha2-256+
@@ -104,17 +117,19 @@ Returns true for the OpenSSH and RFC 5647 AES-GCM profiles, or false otherwise."
       (rfc5647-gcm-cipher-p algorithm)))
 
 (defparameter +kex-extension-markers+
-  (list +ext-info-c+)
+  (list +ext-info-c+ "kex-strict-c-v00@openssh.com")
   "KEXINIT marker names that advertise extension support without being real KEX algorithms.")
 
 ;;;; SSH_MSG_KEXINIT encoding (RFC 4253 §7.1)
 
-(defun kexinit-payload (&key (include-ext-info-c-p t))
-  "Build and return the full SSH_MSG_KEXINIT payload as an octet vector.
-   The 16-byte random cookie is generated freshly each call.
-
-   INCLUDE-EXT-INFO-C-P controls whether the RFC 8308 client marker is
-   advertised in this first key exchange."
+(defun kexinit-payload (&key
+                          (include-ext-info-c-p t)
+                          (compression-algorithms-c2s +preferred-compression+)
+                          (compression-algorithms-s2c +preferred-compression+))
+  "Build a KEXINIT payload with a fresh random cookie.
+INCLUDE-EXT-INFO-C-P enables the initial RFC 8308 and OpenSSH strict-KEX markers.
+COMPRESSION-ALGORITHMS-C2S and COMPRESSION-ALGORITHMS-S2C select the directional lists.
+Returns the full SSH_MSG_KEXINIT payload as an octet vector."
   (let ((buf (make-write-buffer)))
     (write-byte* buf +msg-kexinit+)
     ;; 16 random cookie bytes
@@ -128,8 +143,8 @@ Returns true for the OpenSSH and RFC 5647 AES-GCM profiles, or false otherwise."
     (write-name-list buf +preferred-cipher+)   ; encryption server→client
     (write-name-list buf +preferred-mac+)      ; MAC client→server
     (write-name-list buf +preferred-mac+)      ; MAC server→client
-    (write-name-list buf +preferred-compression+) ; compression client→server
-    (write-name-list buf +preferred-compression+) ; compression server→client
+    (write-name-list buf compression-algorithms-c2s) ; compression client→server
+    (write-name-list buf compression-algorithms-s2c) ; compression server→client
     (write-name-list buf '())                  ; languages client→server
     (write-name-list buf '())                  ; languages server→client
     (write-boolean buf nil)                    ; first_kex_packet_follows
@@ -208,7 +223,12 @@ Returns true for the OpenSSH and RFC 5647 AES-GCM profiles, or false otherwise."
             (error "No common MAC ~A algorithm with server~%  ours:   ~A~%  theirs: ~A"
                    direction +preferred-classic-mac+ server-macs)))))))
 
-(defun negotiate-algorithms (server-kexinit)
+(defun negotiate-algorithms (server-kexinit
+                             &key
+                               (compression-algorithms-c2s
+                                 +preferred-compression+)
+                               (compression-algorithms-s2c
+                                 +preferred-compression+))
   "Select algorithms by matching our preference lists against the server's
    KEXINIT.  Returns a NEGOTIATED struct or signals an error on failure."
   (flet ((pick (category our-list server-list)
@@ -237,8 +257,8 @@ Returns true for the OpenSSH and RFC 5647 AES-GCM profiles, or false otherwise."
          :mac-c2s mac-c2s
          :mac-s2c mac-s2c
          :compression-c2s (pick "compression c→s"
-                                +preferred-compression+
+                                compression-algorithms-c2s
                                 (kexinit-compression-algorithms-c2s server-kexinit))
          :compression-s2c (pick "compression s→c"
-                                +preferred-compression+
+                                compression-algorithms-s2c
                                 (kexinit-compression-algorithms-s2c server-kexinit)))))))

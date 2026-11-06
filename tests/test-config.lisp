@@ -364,6 +364,29 @@ Host web-prod
       (is eq :unset (ssh-config-rekey-byte-limit cfg))
       (is eq :unset (ssh-config-rekey-seconds-limit cfg)))))
 
+(define-test config-skips-invalid-utf-8-lines
+  :parent (:ssh/tests ssh/tests)
+  (let ((path (merge-pathnames (format nil "cl-ssh-test-invalid-utf8-~A.config"
+                                       (gensym))
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (with-open-file (stream path
+                                   :direction :output
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create
+                                   :element-type '(unsigned-byte 8))
+             (write-byte #xa0 stream)
+             (write-byte #x0a stream)
+             (write-sequence
+              (babel:string-to-octets
+               (format nil "Host example~%    User alice~%")
+               :encoding :utf-8)
+              stream))
+           (let ((cfg (resolve-host "example" :config-path path)))
+             (is string= "alice" (ssh-config-user cfg))))
+      (ignore-errors (delete-file path)))))
+
 ;;; ---- resolve-host: missing file ----------------------------------------
 
 (define-test missing-config-file-returns-empty

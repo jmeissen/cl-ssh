@@ -1,0 +1,58 @@
+# Forgejo variant of .github/workflows/fuzz.yml; keep job logic synchronized.
+name: Fuzzing
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    env:
+      LISP: sbcl-bin
+      FUZZ_TARGET: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [packet, kexinit, ext-info, public-key, signature, private-key, known-hosts, config, zlib, sftp]
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.forgejo/actions/setup-lisp
+      - run: qlot install
+      - name: Build Radamsa 0.7
+        run: |
+          if ! command -v radamsa >/dev/null 2>&1; then
+            radamsa_build_dir=$(mktemp -d)
+            trap 'rm -rf "$radamsa_build_dir"' EXIT
+            curl --fail --location --silent --show-error \
+              https://gitlab.com/akihe/radamsa/uploads/d774a42f7893012d0a56c490a75ae12b/radamsa-0.7.c.gz \
+              -o "$radamsa_build_dir/radamsa.c.gz"
+            gzip --decompress --stdout "$radamsa_build_dir/radamsa.c.gz" | \
+              cc -O2 -x c -o "$radamsa_build_dir/radamsa" -
+            if command -v sudo >/dev/null 2>&1; then
+              sudo install --mode=0755 "$radamsa_build_dir/radamsa" /usr/local/bin/radamsa
+            else
+              install --mode=0755 "$radamsa_build_dir/radamsa" /usr/local/bin/radamsa
+            fi
+          fi
+      - name: Mutate with coverage feedback
+        run: |
+          SSH_FUZZ_ITERATIONS=10 SSH_FUZZ_COVERAGE_FEEDBACK=1 \
+            bash scripts/run-fuzz.sh mutate "$FUZZ_TARGET"
+      - name: Reject retained faults
+        run: bash scripts/run-fuzz.sh verify "$FUZZ_TARGET"
+      - run: bash scripts/run-fuzz.sh coverage
+      # Forgejo requires the v3 artifact protocol, as in ci.yml.
+      - uses: https://data.forgejo.org/actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        if: always()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: .fuzz-output
+          if-no-files-found: error

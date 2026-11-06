@@ -7,11 +7,12 @@
 
 (in-package :ssh/tests/ssh)
 
-(defun run-connect-with-mocks (&key config-content connect-args)
+(defun run-connect-with-mocks (&key config-content connect-args (destination "myserver"))
   (let* ((mock-config-path (ssh/tests/config::write-temp-config (or config-content "")))
          (original-resolve (symbol-function 'ssh/config:resolve-host))
          (original-connect (symbol-function 'ssh/transport:connect-transport))
          (original-authenticate (symbol-function 'ssh/auth:authenticate))
+         (original-make-connection (symbol-function 'ssh/connection:make-connection))
          (captured-connect-args nil)
          (captured-authenticate-args nil)
          (transport (ssh/transport::make-transport)))
@@ -28,13 +29,19 @@
                  (symbol-function 'ssh/auth:authenticate)
                  (lambda (&rest args)
                    (setf captured-authenticate-args args)
-                   t))
-           (values (apply #'connect "myserver" connect-args)
+                   t)
+                 (symbol-function 'ssh/connection:make-connection)
+                 (lambda (connected-transport)
+                   (ssh/connection::%make-connection
+                    :transport connected-transport)))
+           (values (apply #'connect destination connect-args)
                    captured-connect-args
                    captured-authenticate-args))
       (setf (symbol-function 'ssh/config:resolve-host) original-resolve
             (symbol-function 'ssh/transport:connect-transport) original-connect
-            (symbol-function 'ssh/auth:authenticate) original-authenticate))))
+            (symbol-function 'ssh/auth:authenticate) original-authenticate
+            (symbol-function 'ssh/connection:make-connection)
+            original-make-connection))))
 
 (define-test connect-passes-explicit-rekey-limits-to-transport
   :parent (:ssh/tests ssh/tests)
@@ -49,6 +56,36 @@
       (is = 65536 (getf args :rekey-byte-limit))
       (is = 120 (getf args :rekey-seconds-limit)))
     (is string= "alice" (second authenticate-call))))
+
+(define-test connect-defaults-host-key-policy-to-yes
+  :parent (:ssh/tests ssh/tests)
+  (multiple-value-bind (client connect-call authenticate-call)
+      (run-connect-with-mocks)
+    (declare (ignore client authenticate-call))
+    (destructuring-bind (host args) connect-call
+      (declare (ignore host))
+      (is eq :yes (getf args :strict-host-checking)))))
+
+(define-test connect-preserves-accept-new-from-config
+  :parent (:ssh/tests ssh/tests)
+  (multiple-value-bind (client connect-call authenticate-call)
+      (run-connect-with-mocks
+       :config-content "Host myserver
+    StrictHostKeyChecking accept-new
+")
+    (declare (ignore client authenticate-call))
+    (destructuring-bind (host args) connect-call
+      (declare (ignore host))
+      (is eq :accept-new (getf args :strict-host-checking)))))
+
+(define-test connect-normalizes-explicit-nil-host-key-policy
+  :parent (:ssh/tests ssh/tests)
+  (multiple-value-bind (client connect-call authenticate-call)
+      (run-connect-with-mocks :connect-args '(:strict-host-checking nil))
+    (declare (ignore client authenticate-call))
+    (destructuring-bind (host args) connect-call
+      (declare (ignore host))
+      (is eq :no (getf args :strict-host-checking)))))
 
 (define-test connect-uses-config-rekey-limits
   :parent (:ssh/tests ssh/tests)

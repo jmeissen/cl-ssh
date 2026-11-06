@@ -19,8 +19,10 @@
                 #:+msg-kexinit+
                 #:+msg-newkeys+
                 #:+msg-ext-info+
+                #:+msg-newcompress+
                 #:+msg-service-request+
                 #:+msg-service-accept+
+                #:+msg-userauth-success+
                 #:+msg-disconnect+
                 #:+msg-ignore+
                 #:+msg-debug+
@@ -36,26 +38,40 @@
                 #:+mac-hmac-sha2-512+
                 #:+client-version-string+
                 #:+ext-info-c+
-                #:+disconnect-protocol-error+)
+                #:+ext-info-s+
+                #:+extension-delay-compression+
+                #:+compression-none+
+                #:+compression-zlib-openssh+
+                #:+disconnect-protocol-error+
+                #:+disconnect-key-exchange-failed+
+                #:+disconnect-compression-error+)
   (:import-from #:ssh/buffer
                 #:octets-to-ascii
                 #:make-write-buffer #:write-byte* #:write-uint32 #:write-string*
+                #:write-name-list
                 #:buffer-to-octets
                 #:make-read-buffer #:read-byte* #:read-uint32 #:read-string*
                 #:read-remaining-bytes #:read-name-list)
   (:import-from #:ssh/packet
                 #:make-packet-stream #:send-packet #:recv-packet
-                #:install-keys #:install-gcm-keys
+                #:install-keys #:install-gcm-keys #:install-compression
                 #:make-hmac-mac-fn #:ssh-protocol-error
                 #:packet-stream-packets-out #:packet-stream-packets-in
                 #:packet-stream-bytes-out #:packet-stream-bytes-in)
   (:import-from #:ssh/algorithms
                 #:kexinit-payload #:parse-kexinit #:kexinit-kex-algorithms
+                #:kexinit-compression-algorithms-c2s
+                #:kexinit-compression-algorithms-s2c
                 #:negotiate-algorithms
+                #:+preferred-compression+
+                #:+preferred-delay-compression+
                 #:gcm-cipher-p
                 #:negotiated-kex #:negotiated-host-key
                 #:negotiated-cipher-c2s #:negotiated-cipher-s2c
-                #:negotiated-mac-c2s #:negotiated-mac-s2c)
+                #:negotiated-mac-c2s #:negotiated-mac-s2c
+                #:negotiated-compression-c2s #:negotiated-compression-s2c)
+  (:import-from #:ssh/compression
+                #:compression-error)
   (:import-from #:ssh/kex
                 #:perform-kex-curve25519
                 #:perform-kex-dh-group14
@@ -69,6 +85,7 @@
                 #:check-host-key)
   (:export
    #:transport
+   #:transport-socket
    #:transport-packet-stream
    #:transport-session-id
    #:transport-hostname
@@ -114,15 +131,35 @@
      (error 'transport-error
             :message (format nil "invalid rekey limit: ~S" value)))))
 
+(defun normalize-compression-policy (value)
+  (if (member value '(:none :zlib :delayed))
+      value
+      (error 'transport-error
+             :message (format nil "invalid compression policy: ~S" value))))
+
 (defstruct transport
   packet-stream
   session-id
+  (strict-kex-p nil :type boolean)
   server-sig-algs
+  (compression-policy :none)
+  (server-ext-info-s-p nil :type boolean)
+  (client-delay-compression-sent-p nil :type boolean)
+  client-delay-compression-c2s
+  client-delay-compression-s2c
+  server-delay-compression-c2s
+  server-delay-compression-s2c
+  delayed-compression-c2s
+  delayed-compression-s2c
+  negotiated-compression-c2s
+  negotiated-compression-s2c
+  (authentication-complete-p nil :type boolean)
+  (delayed-compression-triggered-p nil :type boolean)
   hostname
   client-version
   server-version
   known-hosts-path
-  (strict-host-checking t)
+  (strict-host-checking :yes)
   pending-packets
   (pending-packet-count 0 :type (integer 0 *))
   (pending-packet-bytes 0 :type (integer 0 *))
@@ -139,6 +176,28 @@
   (rekey-pending-byte-limit +default-rekey-pending-byte-limit+)
   ;; The raw socket (kept for cleanup)
   socket)
+
+(defun transport-kex-compression-lists (transport)
+  (let ((algorithms
+          (case (transport-compression-policy transport)
+            (:none (list +compression-none+))
+            (:zlib +preferred-compression+)
+            (:delayed
+             (if (transport-authentication-complete-p transport)
+                 +preferred-compression+
+                 (list +compression-none+)))
+            (otherwise
+             (error 'transport-error
+                    :message "invalid compression policy in transport")))))
+    (values algorithms algorithms)))
+
+(defun delayed-compression-rekey-blocked-p (transport)
+  (and (eq (transport-compression-policy transport) :delayed)
+       (not (transport-authentication-complete-p transport))))
+
+(defun openssh-delayed-compression-p (algorithm)
+  (and algorithm
+       (string= algorithm +compression-zlib-openssh+)))
 
 ;;;; Algorithm → Ironclad cipher mapping
 
@@ -280,6 +339,15 @@
         (send-packet ps (buffer-to-octets buf)))
     (error () nil)))                        ; ignore errors during teardown
 
+(defun recv-transport-packet (transport)
+  (handler-case
+      (recv-packet (transport-packet-stream transport))
+    (compression-error (condition)
+      (send-disconnect (transport-packet-stream transport)
+                       +disconnect-compression-error+
+                       (princ-to-string condition))
+      (error condition))))
+
 (defun parse-ext-info-payload (payload)
   "Parse SSH_MSG_EXT_INFO and return an alist of extension names to raw values."
   (handler-case
@@ -307,6 +375,78 @@
         while end
         do (setf start (1+ end))))
 
+(defun make-delay-compression-value (c2s s2c)
+  (let ((buf (make-write-buffer)))
+    (write-name-list buf c2s)
+    (write-name-list buf s2c)
+    (buffer-to-octets buf)))
+
+(defun parse-delay-compression-value (value)
+  (handler-case
+      (let ((buf (make-read-buffer value)))
+        (let ((c2s (read-name-list buf))
+              (s2c (read-name-list buf)))
+          (when (plusp (read-remaining-bytes buf))
+            (error 'transport-error
+                   :message "malformed delay-compression value: trailing bytes"))
+          (values c2s s2c)))
+    (transport-error (condition)
+      (error condition))
+    (error (condition)
+      (error 'transport-error
+             :message (format nil "malformed delay-compression value: ~A"
+                              condition)))))
+
+(defun first-common-compression (client-list server-list)
+  (find-if (lambda (algorithm)
+             (member algorithm server-list :test #'string=))
+           client-list))
+
+(defun recompute-delayed-compression (transport)
+  (setf (transport-delayed-compression-c2s transport) nil
+        (transport-delayed-compression-s2c transport) nil)
+  (when (and (transport-client-delay-compression-sent-p transport)
+             (transport-server-delay-compression-c2s transport)
+             (transport-server-delay-compression-s2c transport))
+    (let ((c2s (first-common-compression
+                (transport-client-delay-compression-c2s transport)
+                (transport-server-delay-compression-c2s transport)))
+          (s2c (first-common-compression
+                (transport-client-delay-compression-s2c transport)
+                (transport-server-delay-compression-s2c transport))))
+      (unless (and c2s s2c)
+        (let ((message "no common RFC 8308 delayed compression algorithm"))
+          ;; RFC 8308 section 3.2 requires the same disconnect behavior as
+          ;; failed KEXINIT algorithm negotiation.
+          (send-disconnect (transport-packet-stream transport)
+                           +disconnect-key-exchange-failed+
+                           message)
+          (error 'transport-error :message message)))
+      (setf (transport-delayed-compression-c2s transport) c2s
+            (transport-delayed-compression-s2c transport) s2c))))
+
+(defun make-client-delay-compression-ext-info (c2s s2c)
+  (let ((buf (make-write-buffer)))
+    (write-byte* buf +msg-ext-info+)
+    (write-uint32 buf 1)
+    (write-string* buf +extension-delay-compression+)
+    (write-string* buf (make-delay-compression-value c2s s2c))
+    (buffer-to-octets buf)))
+
+(defun send-client-delay-compression-ext-info (transport)
+  (when (and (eq (transport-compression-policy transport) :delayed)
+             (transport-server-ext-info-s-p transport)
+             (not (transport-client-delay-compression-sent-p transport)))
+    (let ((c2s (copy-list +preferred-delay-compression+))
+          (s2c (copy-list +preferred-delay-compression+)))
+      ;; RFC 8308 section 2.4 requires this to be the next client packet after the
+      ;; first NEWKEYS. The caller invokes this before any other send.
+      (send-packet (transport-packet-stream transport)
+                   (make-client-delay-compression-ext-info c2s s2c))
+      (setf (transport-client-delay-compression-sent-p transport) t
+            (transport-client-delay-compression-c2s transport) c2s
+            (transport-client-delay-compression-s2c transport) s2c))))
+
 (defun process-ext-info (transport payload)
   "Update TRANSPORT state from an SSH_MSG_EXT_INFO payload."
   (handler-case
@@ -316,6 +456,19 @@
                 (when entry
                   (csv-string-to-name-list
                    (octets-to-ascii (cdr entry))))))
+        (let ((entry (assoc +extension-delay-compression+
+                            extensions
+                            :test #'string=)))
+          (if entry
+              (multiple-value-bind (c2s s2c)
+                  (parse-delay-compression-value (cdr entry))
+                (setf (transport-server-delay-compression-c2s transport) c2s
+                      (transport-server-delay-compression-s2c transport) s2c))
+              ;; RFC 8308 section 2.4 says a second server EXT_INFO replaces the
+              ;; first, so absence removes an earlier delayed offer.
+              (setf (transport-server-delay-compression-c2s transport) nil
+                    (transport-server-delay-compression-s2c transport) nil))
+          (recompute-delayed-compression transport))
         nil)
     (ssh/buffer:buffer-format-error (c)
       (error 'transport-error
@@ -334,6 +487,61 @@
 (defun payload-message-type (payload)
   (when (plusp (length payload))
     (aref payload 0)))
+
+(defun negotiate-strict-kex (transport client-kexinit server-kexinit)
+  ;; The initial negotiation persists across rekeys, including absent markers.
+  (unless (transport-session-id transport)
+    (setf (transport-strict-kex-p transport)
+          (and (not (null (member "kex-strict-c-v00@openssh.com"
+                                  (kexinit-kex-algorithms client-kexinit)
+                                  :test #'string=)))
+               (not (null (member "kex-strict-s-v00@openssh.com"
+                                  (kexinit-kex-algorithms server-kexinit)
+                                  :test #'string=)))))
+    ;; Use the non-wrapping count: a wrapped sequence number must not pass.
+    (when (and (transport-strict-kex-p transport)
+               (/= 1 (packet-stream-packets-in (transport-packet-stream transport))))
+      (error 'transport-error :message "Strict KEX requires KEXINIT as the first packet")))
+  (transport-strict-kex-p transport))
+
+(defun delayed-compression-negotiated-p (transport)
+  (and (transport-delayed-compression-c2s transport)
+       (transport-delayed-compression-s2c transport)))
+
+(defun note-userauth-success (transport)
+  (unless (transport-authentication-complete-p transport)
+    ;; USERAUTH_SUCCESS itself was decoded with the old inbound algorithm.
+    ;; RFC 8308 activates the negotiated server-to-client algorithm for the
+    ;; next message, so replace the context before receiving anything else.
+    (when (delayed-compression-negotiated-p transport)
+      (install-compression
+       (transport-packet-stream transport)
+       :in (transport-delayed-compression-s2c transport))
+      ;; NEWCOMPRESS is the client trigger and is sent with the old outbound
+      ;; algorithm. The fresh outbound context applies to the next message.
+      (send-packet (transport-packet-stream transport)
+                   (make-array 1
+                               :element-type '(unsigned-byte 8)
+                               :initial-element +msg-newcompress+))
+      (install-compression
+       (transport-packet-stream transport)
+       :out (transport-delayed-compression-c2s transport))
+      (setf (transport-delayed-compression-triggered-p transport) t))
+    ;; OpenSSH's negotiated delayed-zlib method has no NEWCOMPRESS trigger.
+    ;; Both contexts start after USERAUTH_SUCCESS itself has been decoded, so
+    ;; the next packet in each direction begins a fresh zlib stream.
+    (unless (delayed-compression-negotiated-p transport)
+      (when (openssh-delayed-compression-p
+             (transport-negotiated-compression-s2c transport))
+        (install-compression
+         (transport-packet-stream transport)
+         :in (transport-negotiated-compression-s2c transport)))
+      (when (openssh-delayed-compression-p
+             (transport-negotiated-compression-c2s transport))
+        (install-compression
+         (transport-packet-stream transport)
+         :out (transport-negotiated-compression-c2s transport))))
+    (setf (transport-authentication-complete-p transport) t)))
 
 (defun enqueue-pending-packet (transport packet)
   (let ((new-count (1+ (transport-pending-packet-count transport)))
@@ -365,6 +573,7 @@
   (let ((ps (transport-packet-stream transport)))
     (and (transport-session-id transport)
          (not (transport-rekeying-p transport))
+         (not (delayed-compression-rekey-blocked-p transport))
          (or (rekey-limit-reached-p (packet-stream-packets-out ps)
                                     (transport-last-rekey-packets-out transport)
                                     (transport-rekey-packet-limit transport))
@@ -413,50 +622,82 @@
       octets
       (subseq octets 0 length)))
 
-(defun install-kex-result-keys (packet-stream kex-result negotiated direction)
+(defun install-kex-result-keys (packet-stream kex-result negotiated direction
+                                &key post-authentication-p)
   (ecase direction
     (:out
      (let* ((cipher-name (negotiated-cipher-c2s negotiated))
-            (mac-name    (negotiated-mac-c2s negotiated))
-            (iv          (prefix-octets (kex-result-iv-c2s kex-result)
-                                        (cipher-iv-length cipher-name)))
-            (key         (prefix-octets (kex-result-key-c2s kex-result)
-                                        (cipher-key-length cipher-name))))
+            (mac-name (negotiated-mac-c2s negotiated))
+            (compression-name
+              (or (negotiated-compression-c2s negotiated)
+                  +compression-none+))
+            (active-compression-name
+              (if (and (openssh-delayed-compression-p compression-name)
+                       (not post-authentication-p))
+                  +compression-none+
+                  compression-name))
+            (iv (prefix-octets (kex-result-iv-c2s kex-result)
+                               (cipher-iv-length cipher-name)))
+            (key (prefix-octets (kex-result-key-c2s kex-result)
+                                (cipher-key-length cipher-name))))
        (if (gcm-cipher-p cipher-name)
            (install-gcm-keys packet-stream :key-out key :iv-out iv)
            (let ((mac-key (prefix-octets (kex-result-mac-c2s kex-result)
                                          (mac-key-length mac-name))))
              (install-keys packet-stream
-               :cipher-out     (make-aes-ctr-cipher key iv)
-               :block-size-out (cipher-block-size cipher-name)
-               :mac-out        (make-hmac-mac-fn mac-key (mac-digest-name mac-name))
-               :mac-length-out (mac-output-length mac-name))))))
+                           :cipher-out (make-aes-ctr-cipher key iv)
+                           :block-size-out (cipher-block-size cipher-name)
+                           :mac-out (make-hmac-mac-fn mac-key (mac-digest-name mac-name))
+                           :mac-length-out (mac-output-length mac-name))))
+       (install-compression packet-stream :out active-compression-name)))
     (:in
      (let* ((cipher-name (negotiated-cipher-s2c negotiated))
-            (mac-name    (negotiated-mac-s2c negotiated))
-            (iv          (prefix-octets (kex-result-iv-s2c kex-result)
-                                        (cipher-iv-length cipher-name)))
-            (key         (prefix-octets (kex-result-key-s2c kex-result)
-                                        (cipher-key-length cipher-name))))
+            (mac-name (negotiated-mac-s2c negotiated))
+            (compression-name
+              (or (negotiated-compression-s2c negotiated)
+                  +compression-none+))
+            (active-compression-name
+              (if (and (openssh-delayed-compression-p compression-name)
+                       (not post-authentication-p))
+                  +compression-none+
+                  compression-name))
+            (iv (prefix-octets (kex-result-iv-s2c kex-result)
+                               (cipher-iv-length cipher-name)))
+            (key (prefix-octets (kex-result-key-s2c kex-result)
+                                (cipher-key-length cipher-name))))
        (if (gcm-cipher-p cipher-name)
            (install-gcm-keys packet-stream :key-in key :iv-in iv)
            (let ((mac-key (prefix-octets (kex-result-mac-s2c kex-result)
                                          (mac-key-length mac-name))))
              (install-keys packet-stream
-               :cipher-in      (make-aes-ctr-cipher key iv)
-               :block-size-in  (cipher-block-size cipher-name)
-               :mac-in         (make-hmac-mac-fn mac-key (mac-digest-name mac-name))
-               :mac-length-in  (mac-output-length mac-name))))))))
+                           :cipher-in (make-aes-ctr-cipher key iv)
+                           :block-size-in (cipher-block-size cipher-name)
+                           :mac-in (make-hmac-mac-fn mac-key (mac-digest-name mac-name))
+                           :mac-length-in (mac-output-length mac-name))))
+       (install-compression packet-stream :in active-compression-name)))))
 
-(defun perform-negotiated-key-exchange (transport client-kexinit-payload server-kexinit-payload)
+(defun %perform-negotiated-key-exchange (transport client-kexinit-payload server-kexinit-payload)
   (unless (= (or (payload-message-type server-kexinit-payload) -1) +msg-kexinit+)
     (error 'transport-error
            :message (format nil "expected KEXINIT (20), got ~D"
                             (or (payload-message-type server-kexinit-payload) -1))))
   (let* ((packet-stream (transport-packet-stream transport))
-         (server-kexinit (parse-kexinit server-kexinit-payload)))
+         (server-kexinit (parse-kexinit server-kexinit-payload))
+         (client-kexinit (parse-kexinit client-kexinit-payload))
+         (initial-exchange-p (null (transport-session-id transport))))
     (validate-server-kexinit server-kexinit)
-    (let* ((neg (negotiate-algorithms server-kexinit))
+    (negotiate-strict-kex transport client-kexinit server-kexinit)
+    (when initial-exchange-p
+      (setf (transport-server-ext-info-s-p transport)
+            (not (null (member +ext-info-s+
+                               (kexinit-kex-algorithms server-kexinit)
+                               :test #'string=)))))
+    (let* ((neg (negotiate-algorithms
+                 server-kexinit
+                 :compression-algorithms-c2s
+                 (kexinit-compression-algorithms-c2s client-kexinit)
+                 :compression-algorithms-s2c
+                 (kexinit-compression-algorithms-s2c client-kexinit)))
            (kex-algo      (negotiated-kex neg))
            (host-key-algo (negotiated-host-key neg))
            (cipher-c2s    (negotiated-cipher-c2s neg))
@@ -477,6 +718,10 @@
                                                    (cipher-key-length cipher-s2c))
                            :mac-key-length (max (mac-key-length mac-c2s-name)
                                                 (mac-key-length mac-s2c-name)))))
+      (setf (transport-negotiated-compression-c2s transport)
+            (negotiated-compression-c2s neg)
+            (transport-negotiated-compression-s2c transport)
+            (negotiated-compression-s2c neg))
       (let ((kex-result
               (cond
                 ((or (string= kex-algo "curve25519-sha256")
@@ -489,143 +734,187 @@
                         :message (format nil "negotiated unsupported KEX: ~S"
                                          kex-algo))))))
         (send-newkeys packet-stream)
-        (install-kex-result-keys packet-stream kex-result neg :out)
+        (when (transport-strict-kex-p transport)
+          (setf (ssh/packet:packet-stream-seq-out packet-stream) 0))
+        (install-kex-result-keys packet-stream kex-result neg :out
+                                 :post-authentication-p
+                                 (transport-authentication-complete-p transport))
+        (when initial-exchange-p
+          (send-client-delay-compression-ext-info transport))
+        ;; The surrounding handler maps any decompression failure to exactly
+        ;; one SSH_DISCONNECT_COMPRESSION_ERROR, including failures here.
         (let ((newkeys-pkt (recv-packet packet-stream)))
-          (unless (= (or (payload-message-type newkeys-pkt) -1) +msg-newkeys+)
+          (unless (and (= (length newkeys-pkt) 1)
+                       (= (payload-message-type newkeys-pkt) +msg-newkeys+))
             (error 'transport-error
                    :message (format nil "expected NEWKEYS (21), got ~D"
                                     (or (payload-message-type newkeys-pkt) -1)))))
-        (install-kex-result-keys packet-stream kex-result neg :in)
+        (when (transport-strict-kex-p transport)
+          (setf (ssh/packet:packet-stream-seq-in packet-stream) 0))
+        (install-kex-result-keys packet-stream kex-result neg :in
+                                 :post-authentication-p
+                                 (transport-authentication-complete-p transport))
         (setf (transport-session-id transport)
               (kex-result-session-id kex-result))
         (note-key-exchange-complete transport)
         kex-result))))
 
+(defun perform-negotiated-key-exchange (transport client-kexinit-payload server-kexinit-payload)
+  (handler-case
+      (%perform-negotiated-key-exchange
+       transport client-kexinit-payload server-kexinit-payload)
+    (compression-error (condition)
+      ;; KEX implementations receive directly from PACKET-STREAM. Catch their
+      ;; inflater failures here so RFC 4253's compression disconnect reason is
+      ;; still sent during rekey.
+      (send-disconnect (transport-packet-stream transport)
+                       +disconnect-compression-error+
+                       (princ-to-string condition))
+      (error condition))
+    ((or transport-error ssh-protocol-error) (condition)
+      (send-disconnect (transport-packet-stream transport)
+                       +disconnect-protocol-error+
+                       "Key exchange protocol error")
+      (error condition))))
+
 (defun receive-server-kexinit-for-rekey (transport)
-  (let ((packet-stream (transport-packet-stream transport)))
-    (loop
-      for packet = (recv-packet packet-stream)
-      for type = (payload-message-type packet)
-      do (case type
-           (#.+msg-kexinit+ (return packet))
-           (#.+msg-ignore+ nil)
-           (#.+msg-debug+ nil)
-           (#.+msg-ext-info+ (process-ext-info transport packet))
-           (#.+msg-disconnect+
-            (error 'transport-error :message "server sent SSH_MSG_DISCONNECT"))
-           (otherwise
-            (enqueue-pending-packet transport packet))))))
+  (loop
+    for packet = (recv-transport-packet transport)
+    for type = (payload-message-type packet)
+    do (case type
+         (#.+msg-kexinit+ (return packet))
+         (#.+msg-ignore+ nil)
+         (#.+msg-debug+ nil)
+         (#.+msg-ext-info+ (process-ext-info transport packet))
+         (#.+msg-disconnect+
+          (error 'transport-error :message "server sent SSH_MSG_DISCONNECT"))
+         (otherwise
+          (enqueue-pending-packet transport packet)))))
 
 (defun perform-initial-key-exchange (transport)
-  (let* ((packet-stream (transport-packet-stream transport))
-         (client-kexinit (kexinit-payload :include-ext-info-c-p t)))
-    (send-packet packet-stream client-kexinit)
-    (perform-negotiated-key-exchange
-     transport
-     client-kexinit
-     (recv-packet packet-stream))))
+  (multiple-value-bind (compression-c2s compression-s2c)
+      (transport-kex-compression-lists transport)
+    (let* ((packet-stream (transport-packet-stream transport))
+           (client-kexinit
+             (kexinit-payload
+              :include-ext-info-c-p t
+              :compression-algorithms-c2s compression-c2s
+              :compression-algorithms-s2c compression-s2c)))
+      (send-packet packet-stream client-kexinit)
+      (perform-negotiated-key-exchange
+       transport
+       client-kexinit
+       (recv-transport-packet transport)))))
 
 (defun transport-rekey (transport &key server-kexinit-payload)
   (when (transport-rekeying-p transport)
     (return-from transport-rekey nil))
-  (let* ((packet-stream (transport-packet-stream transport))
-         (client-kexinit (kexinit-payload :include-ext-info-c-p nil)))
-    (setf (transport-rekeying-p transport) t)
-    (unwind-protect
-         (let ((server-payload
-                 (if server-kexinit-payload
-                     (progn
-                       (send-packet packet-stream client-kexinit)
-                       server-kexinit-payload)
-                     (progn
-                       (send-packet packet-stream client-kexinit)
-                       (receive-server-kexinit-for-rekey transport)))))
-           (perform-negotiated-key-exchange transport client-kexinit server-payload))
-      (setf (transport-rekeying-p transport) nil))))
+  (when (and (null server-kexinit-payload)
+             (delayed-compression-rekey-blocked-p transport))
+    (return-from transport-rekey nil))
+  (multiple-value-bind (compression-c2s compression-s2c)
+      (transport-kex-compression-lists transport)
+    (let* ((packet-stream (transport-packet-stream transport))
+           (client-kexinit
+             (kexinit-payload
+              :include-ext-info-c-p nil
+              :compression-algorithms-c2s compression-c2s
+              :compression-algorithms-s2c compression-s2c)))
+      (setf (transport-rekeying-p transport) t)
+      (unwind-protect
+           (progn
+             (send-packet packet-stream client-kexinit)
+             (perform-negotiated-key-exchange
+              transport client-kexinit
+              (or server-kexinit-payload
+                  (receive-server-kexinit-for-rekey transport))))
+        (setf (transport-rekeying-p transport) nil)))))
 
 ;;;; Main setup
 
 (defun connect-transport (hostname
-                          &key (port 22)
-                            (known-hosts-path nil)
-                            (strict-host-checking t)
+                          &key (port 22) (known-hosts-path nil) (strict-host-checking :yes)
+                            (compression :none)
                             (rekey-byte-limit +default-rekey-byte-limit+)
                             (rekey-seconds-limit +default-rekey-seconds-limit+))
-  "Open a TCP connection to HOSTNAME:PORT, perform the full SSH transport
-   handshake (version exchange, KEX, host-key verification, NEWKEYS, service
-   request), and return a TRANSPORT struct ready for use by the auth layer.
-
-   KNOWN-HOSTS-PATH  — pathname for the known_hosts file; NIL uses the default.
-   STRICT-HOST-CHECKING — if true (default), refuse changed host keys."
-  (let* ((socket (usocket:socket-connect hostname port
-                                         :element-type '(unsigned-byte 8)))
-         (stream (usocket:socket-stream socket))
-         (ps (make-packet-stream stream))
-         (transport (make-transport :packet-stream ps
-                                    :hostname hostname
-                                    :known-hosts-path known-hosts-path
-                                    :strict-host-checking strict-host-checking
-                                    :rekey-byte-limit (normalize-rekey-limit
-                                                       rekey-byte-limit
-                                                       +default-rekey-byte-limit+)
-                                    :rekey-seconds-limit (normalize-rekey-limit
-                                                          rekey-seconds-limit
-                                                          +default-rekey-seconds-limit+)
-                                    :socket socket)))
-
-    (handler-bind ((error (lambda (e)
-                            (declare (ignore e))
-                            (ignore-errors (usocket:socket-close socket)))))
-
-      ;; 1. Version exchange
-      (send-version stream)
-      (let* ((our-version (map '(vector (unsigned-byte 8)) #'char-code +client-version-string+))
-             (server-version (recv-version stream)))
-        (setf (transport-client-version transport) our-version
-              (transport-server-version transport) server-version)
-
-        (perform-initial-key-exchange transport)
-
-        ;; Request the userauth service.
-        (let ((svc-buf (make-write-buffer)))
-          (write-byte* svc-buf +msg-service-request+)
-          (write-string* svc-buf +service-userauth+)
-          (send-packet ps (buffer-to-octets svc-buf)))
-
-        ;; Expect SSH_MSG_SERVICE_ACCEPT.
-        (let ((svc-reply (transport-recv-skipping-global
-                          transport +msg-service-accept+)))
-          (declare (ignore svc-reply)))
-
-        transport))))
+  "Open a TCP connection and negotiate an SSH transport ready for authentication.
+HOSTNAME names the remote SSH server.
+PORT is its TCP port number.
+KNOWN-HOSTS-PATH selects the host-key database, or NIL for the default.
+STRICT-HOST-CHECKING selects the host-key verification policy.
+COMPRESSION selects :NONE, :ZLIB, or :DELAYED compression.
+REKEY-BYTE-LIMIT and REKEY-SECONDS-LIMIT select automatic rekey thresholds.
+Returns the negotiated TRANSPORT, releasing its socket if setup unwinds."
+  ;; Reject local option errors before allocating a socket.
+  (let ((compression (normalize-compression-policy compression))
+        (rekey-byte-limit (normalize-rekey-limit rekey-byte-limit +default-rekey-byte-limit+))
+        (rekey-seconds-limit (normalize-rekey-limit rekey-seconds-limit +default-rekey-seconds-limit+))
+        (socket nil)
+        (transferred-p nil))
+    (unwind-protect
+         (progn
+           (setf socket (usocket:socket-connect hostname port
+                                               :element-type '(unsigned-byte 8)))
+           (let* ((stream (usocket:socket-stream socket))
+                  (ps (make-packet-stream stream))
+                  (transport (make-transport :packet-stream ps :hostname hostname
+                               :known-hosts-path known-hosts-path
+                               :strict-host-checking strict-host-checking
+                               :compression-policy compression
+                               :rekey-byte-limit rekey-byte-limit
+                               :rekey-seconds-limit rekey-seconds-limit :socket socket)))
+             (send-version stream)
+             (let* ((our-version (map '(vector (unsigned-byte 8)) #'char-code +client-version-string+))
+                    (server-version (recv-version stream)))
+               (setf (transport-client-version transport) our-version
+                     (transport-server-version transport) server-version)
+               (perform-initial-key-exchange transport)
+               (let ((svc-buf (make-write-buffer)))
+                 (write-byte* svc-buf +msg-service-request+)
+                 (write-string* svc-buf +service-userauth+)
+                 (send-packet ps (buffer-to-octets svc-buf)))
+               (transport-recv-skipping-global transport +msg-service-accept+)
+               (prog1 transport (setf transferred-p t)))))
+      (unless transferred-p
+        (when socket (ignore-errors (usocket:socket-close socket)))))))
 
 ;;;; Message dispatch helpers
+
+(defun transport-recv-step (transport &optional expected-type)
+  ;; Return after one transport message so the dispatcher can service queued work.
+  ;; A key exchange itself must still finish before application traffic resumes.
+  (when (and (null (transport-pending-packets transport))
+             (transport-rekey-needed-p transport))
+    (transport-rekey transport)
+    (return-from transport-recv-step nil))
+  (let ((pkt (or (dequeue-pending-packet transport)
+                 (recv-transport-packet transport))))
+    (case (aref pkt 0)
+      (#.+msg-ignore+ nil)
+      (#.+msg-debug+ nil)
+      (#.+msg-ext-info+
+       (process-ext-info transport pkt)
+       nil)
+      (#.+msg-kexinit+
+       (transport-rekey transport :server-kexinit-payload pkt)
+       nil)
+      (#.+msg-disconnect+
+       (error 'transport-error :message "server sent SSH_MSG_DISCONNECT"))
+      (otherwise
+       (when (= (aref pkt 0) +msg-userauth-success+)
+         (note-userauth-success transport))
+       (when (and expected-type (/= (aref pkt 0) expected-type))
+         (error 'transport-error
+                :message (format nil "expected message type ~D, got ~D"
+                                 expected-type (aref pkt 0))))
+       pkt))))
 
 (defun transport-recv-skipping-global (transport expected-type)
   "Receive packets, silently handling IGNORE/DEBUG/UNIMPLEMENTED, until a
    packet of EXPECTED-TYPE (or any non-global message) is found.
    Returns the payload."
-  (let ((ps (transport-packet-stream transport)))
-    (when (and (null (transport-pending-packets transport))
-               (transport-rekey-needed-p transport))
-      (transport-rekey transport))
-    (loop
-      for pkt = (or (dequeue-pending-packet transport)
-                    (recv-packet ps))
-      do (case (aref pkt 0)
-           (#.+msg-ignore+ nil)   ; discard
-           (#.+msg-debug+ nil)    ; discard (could log)
-           (#.+msg-ext-info+ (process-ext-info transport pkt))
-           (#.+msg-kexinit+
-            (transport-rekey transport :server-kexinit-payload pkt))
-           (#.+msg-disconnect+
-            (error 'transport-error :message "server sent SSH_MSG_DISCONNECT"))
-           (otherwise
-            (when (and expected-type (/= (aref pkt 0) expected-type))
-              (error 'transport-error
-                     :message (format nil "expected message type ~D, got ~D"
-                                      expected-type (aref pkt 0))))
-            (return-from transport-recv-skipping-global pkt))))))
+  (loop for packet = (transport-recv-step transport expected-type)
+        when packet return packet))
 
 ;;;; Public send / recv
 
@@ -640,9 +929,11 @@
   (transport-recv-skipping-global transport nil))
 
 (defun transport-disconnect (transport &optional (reason "normal closure"))
-  "Send SSH_MSG_DISCONNECT and close the TCP connection."
-  (ignore-errors
-    (send-disconnect (transport-packet-stream transport)
-                     11 reason))       ; 11 = SSH_DISCONNECT_BY_APPLICATION
-  (ignore-errors
-    (usocket:socket-close (transport-socket transport))))
+  "Send an SSH disconnect message and release the underlying TCP socket.
+TRANSPORT is the transport to stop.
+REASON is the description sent to the peer when possible.
+Returns true after best-effort disconnection and socket cleanup."
+  (unwind-protect
+       (ignore-errors (send-disconnect (transport-packet-stream transport) 11 reason))
+    (ignore-errors (usocket:socket-close (transport-socket transport))))
+  t)

@@ -141,6 +141,52 @@
     (true (private-key k))
     (true (public-key k))))
 
+(define-test load-private-key-rejects-invalid-utf-8
+  :parent (:ssh/tests ssh/tests)
+  (let ((path (merge-pathnames (format nil "cl-ssh-test-invalid-key-utf8-~A"
+                                       (gensym))
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (with-open-file (stream path
+                                   :direction :output
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create
+                                   :element-type '(unsigned-byte 8))
+             (write-byte #xbb stream))
+           (fail (load-private-key path) 'key-error))
+      (ignore-errors (delete-file path)))))
+
+(define-test load-private-key-rejects-incomplete-begin-marker
+  :parent (:ssh/tests ssh/tests)
+  (let ((path (merge-pathnames (format nil "cl-ssh-test-incomplete-key-marker-~A"
+                                       (gensym))
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (with-open-file (stream path
+                                   :direction :output
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create)
+             (format stream
+                     "--BEGIN OPENSSH PRIVATE KEY-----~%invalid~%-----END OPENSSH PRIVATE KEY-----~%"))
+           (fail (load-private-key path) 'key-error))
+      (ignore-errors (delete-file path)))))
+
+(define-test private-key-base64-boundaries
+  :parent (:ssh/tests ssh/tests)
+  (dolist (case '(("" ()) ("Zg==" (102)) ("Zm8=" (102 111))
+                  ("Zm9v" (102 111 111)) ("Zm9vYg==" (102 111 111 98))
+                  ("Zm9vYmE=" (102 111 111 98 97))
+                  ("Zm9vYmFy" (102 111 111 98 97 114))))
+    (is equalp (coerce (second case) '(vector (unsigned-byte 8)))
+        (ssh/keys::base64-decode (first case))))
+  (is equalp (ssh/tests:octets 102)
+      (ssh/keys::base64-decode (format nil " ~CZg~%==~C" #\Tab #\Return)))
+  (dolist (input '("A" "AA" "AAA" "AAAAA" "AAAAAA" "AAAAAAA"
+                   "=AAA" "A=AA" "AA=A" "====" "AA==AAAA" "AAA=AAAA" "AA!A"))
+    (fail (ssh/keys::base64-decode input) 'key-error)))
+
 ;;;; ---- Encrypted keys with correct passphrase -----------------------------
 ;;;; Because of non-optimized ironclad bcrypt-pbkdf, loading private keys is very
 ;;;; slow for certain CL implementations (such as ECL). So we just skip them if not SBCL.
@@ -304,23 +350,45 @@
     (is string= "rsa-sha2-512"
         (ssh/auth::select-publickey-signature-algorithm transport k))))
 
-(define-test rsa-publickey-auth-falls-back-without-ext-info
+(define-test rsa-publickey-auth-prefers-rsa-sha2-without-ext-info
   :parent (:ssh/tests ssh/tests)
   (let* ((k (load-private-key (fixture "id_rsa_nopass")))
          (transport (ssh/transport::make-transport)))
-    (is string= "ssh-rsa"
+    (is string= "rsa-sha2-512"
         (ssh/auth::select-publickey-signature-algorithm transport k))))
 
-(define-test rsa-publickey-auth-can-sign-with-ssh-rsa
+(define-test rsa-publickey-auth-rejects-legacy-ssh-rsa-by-default
   :parent (:ssh/tests ssh/tests)
-  (let* ((k         (load-private-key (fixture "id_rsa_nopass")))
-         (message   (map '(vector (unsigned-byte 8)) #'char-code "rsa auth sha1 test"))
-         (sig-blob  (sign-auth-data k message :algorithm "ssh-rsa"))
-         (sig-buf   (ssh/buffer:make-read-buffer sig-blob))
-         (algo      (map 'string #'code-char (ssh/buffer:read-string* sig-buf)))
-         (raw-sig   (ssh/buffer:read-string* sig-buf)))
-    (is string= "ssh-rsa" algo)
-    (true (ssh/keys::rsa-pkcs1-verify (public-key k) message raw-sig :sha1))))
+  (let* ((k (load-private-key (fixture "id_rsa_nopass")))
+         (transport (ssh/transport::make-transport :server-sig-algs '("ssh-rsa"))))
+    (of-type 'ssh/auth:auth-error
+      (handler-case
+          (progn
+            (ssh/auth::select-publickey-signature-algorithm transport k)
+            nil)
+        (ssh/auth:auth-error (condition) condition)))))
+
+(define-test rsa-publickey-auth-rejects-legacy-ssh-rsa-signing-by-default
+  :parent (:ssh/tests ssh/tests)
+  (let ((k (load-private-key (fixture "id_rsa_nopass"))))
+    (of-type 'key-error
+      (handler-case
+          (progn
+            (sign-auth-data k #(1 2 3) :algorithm "ssh-rsa")
+            nil)
+        (key-error (condition) condition)))))
+
+(define-test rsa-publickey-auth-can-sign-with-ssh-rsa-when-feature-enabled
+  :parent (:ssh/tests ssh/tests)
+  (let ((*features* (cons :cl-ssh-legacy-rsa-sha1 *features*)))
+    (let* ((k         (load-private-key (fixture "id_rsa_nopass")))
+           (message   (map '(vector (unsigned-byte 8)) #'char-code "rsa auth sha1 test"))
+           (sig-blob  (sign-auth-data k message :algorithm "ssh-rsa"))
+           (sig-buf   (ssh/buffer:make-read-buffer sig-blob))
+           (algo      (map 'string #'code-char (ssh/buffer:read-string* sig-buf)))
+           (raw-sig   (ssh/buffer:read-string* sig-buf)))
+      (is string= "ssh-rsa" algo)
+      (true (ssh/keys::rsa-pkcs1-verify (public-key k) message raw-sig :sha1)))))
 
 (define-test verify-host-key-signature-rsa-sha2-rejects-truncated-signature
   :parent (:ssh/tests ssh/tests)

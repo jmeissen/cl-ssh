@@ -1,0 +1,226 @@
+name: Release security assurance
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: Release-candidate tag being evaluated
+        required: true
+        type: string
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+
+jobs:
+  validate-input:
+    name: Validate release tag input
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a release tag name
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "invalid release tag: $RELEASE_CANDIDATE" >&2
+            exit 64
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ inputs.release_candidate }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify signed annotated tag
+        run: bash scripts/release-evidence.sh "$RELEASE_CANDIDATE"
+
+  fuzz-discovery:
+    name: Discovery (${{ matrix.target }})
+    needs: validate-input
+    runs-on: ubuntu-latest
+    env:
+      LISP: sbcl-bin
+      FUZZ_TARGET: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [packet, kexinit, ext-info, public-key, signature, private-key, known-hosts, config, zlib, sftp]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ inputs.release_candidate }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-lisp
+      - run: qlot install
+      - name: Build Radamsa 0.7
+        run: |
+          if ! command -v radamsa >/dev/null 2>&1; then
+            radamsa_build_dir=$(mktemp -d)
+            trap 'rm -rf "$radamsa_build_dir"' EXIT
+            curl --fail --location --silent --show-error \
+              https://gitlab.com/akihe/radamsa/uploads/d774a42f7893012d0a56c490a75ae12b/radamsa-0.7.c.gz \
+              -o "$radamsa_build_dir/radamsa.c.gz"
+            gzip --decompress --stdout "$radamsa_build_dir/radamsa.c.gz" | \
+              cc -O2 -x c -o "$radamsa_build_dir/radamsa" -
+            if command -v sudo >/dev/null 2>&1; then
+              sudo install --mode=0755 "$radamsa_build_dir/radamsa" /usr/local/bin/radamsa
+            else
+              install --mode=0755 "$radamsa_build_dir/radamsa" /usr/local/bin/radamsa
+            fi
+          fi
+      - name: Fifteen-minute coverage-guided discovery
+        run: |
+          SSH_FUZZ_DURATION_SECONDS=900 SSH_FUZZ_COVERAGE_FEEDBACK=1 \
+            bash scripts/run-fuzz.sh mutate "$FUZZ_TARGET"
+      - name: Thirty-minute coverage plateau
+        shell: bash
+        run: |
+          status=0
+          SSH_FUZZ_DURATION_SECONDS=1800 SSH_FUZZ_COVERAGE_FEEDBACK=1 \
+            SSH_FUZZ_REQUIRE_PLATEAU=1 \
+            bash scripts/run-fuzz.sh mutate "$FUZZ_TARGET" || status=$?
+          classification=$(bash scripts/run-fuzz.sh classify "$status")
+
+          case "$classification" in
+            success)
+              ;;
+            coverage-growth)
+              echo "Coverage grew; extending this target by two CPU-hours."
+              SSH_FUZZ_DURATION_SECONDS=7200 SSH_FUZZ_COVERAGE_FEEDBACK=1 \
+                bash scripts/run-fuzz.sh mutate "$FUZZ_TARGET"
+
+              final_status=0
+              SSH_FUZZ_DURATION_SECONDS=1800 SSH_FUZZ_COVERAGE_FEEDBACK=1 \
+                SSH_FUZZ_REQUIRE_PLATEAU=1 \
+                bash scripts/run-fuzz.sh mutate "$FUZZ_TARGET" || final_status=$?
+              final_classification=$(bash scripts/run-fuzz.sh classify "$final_status")
+              if [ "$final_classification" = coverage-growth ]; then
+                echo "coverage still grew during the final plateau" >&2
+                exit 10
+              elif [ "$final_classification" = fault ]; then
+                exit "$final_status"
+              fi
+              ;;
+            fault)
+              exit "$status"
+              ;;
+          esac
+
+          bash scripts/run-fuzz.sh verify "$FUZZ_TARGET"
+      - run: bash scripts/run-fuzz.sh coverage
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: release-fuzz-${{ matrix.target }}
+          path: .fuzz-output
+          include-hidden-files: true
+          if-no-files-found: error
+
+  validation:
+    name: Release tests (${{ matrix.implementation }})
+    needs: validate-input
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        implementation: [sbcl-bin, ecl]
+    env:
+      LISP: ${{ matrix.implementation }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ inputs.release_candidate }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-lisp
+      - run: qlot install
+      - name: Compile and test
+        run: |
+          qlot exec ros -Q -e \
+            '(progn
+               (asdf:compile-system :ssh :force t)
+               (asdf:test-system :ssh))' \
+            2>&1 | tee "test-${{ matrix.implementation }}.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: release-test-${{ matrix.implementation }}
+          path: test-${{ matrix.implementation }}.log
+
+  integration:
+    name: Release Docker integration
+    needs: validate-input
+    runs-on: ubuntu-latest
+    env:
+      LISP: sbcl-bin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ inputs.release_candidate }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-lisp
+      - run: qlot install
+      - run: bash scripts/run-integration-tests.sh 2>&1 | tee integration.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: release-integration
+          path: integration.log
+
+  secrets:
+    name: Release secret scan
+    needs: validate-input
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ inputs.release_candidate }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan repository history
+        uses: docker://ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f # v8.30.1
+        with:
+          args: git --config .gitleaks.toml --redact --verbose .
+
+  release-evidence:
+    name: Signed-tag release evidence
+    needs: [fuzz-discovery, validation, integration, secrets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ inputs.release_candidate }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist/evidence
+          merge-multiple: false
+      - name: Bundle run evidence
+        run: |
+          cd dist
+          tar -czf release-run-evidence.tar.gz evidence
+      - name: Verify tag and build release files
+        run: bash scripts/release-evidence.sh "$RELEASE_CANDIDATE"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-evidence
+          path: dist
+      - name: Publish release evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_CANDIDATE" \
+            "dist/cl-ssh-$RELEASE_CANDIDATE.tar.gz" \
+            dist/SHA256SUMS \
+            dist/tag.txt \
+            dist/tag-verification.txt \
+            dist/release-run-evidence.tar.gz \
+            --title "$RELEASE_CANDIDATE" \
+            --generate-notes

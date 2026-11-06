@@ -149,101 +149,69 @@
                        (extend (concatenate '(vector (unsigned-byte 8)) current more))))))
         (extend (hash k-bytes h letter-byte session-id))))))
 
+(defun derive-kex-result (k h session-id iv-length cipher-key-length mac-key-length)
+  (let ((sid (or session-id h)))
+    (make-kex-result
+     :session-id sid
+     :shared-secret k
+     :exchange-hash h
+     :iv-c2s (derive-key k h #\A sid iv-length)
+     :iv-s2c (derive-key k h #\B sid iv-length)
+     :key-c2s (derive-key k h #\C sid cipher-key-length)
+     :key-s2c (derive-key k h #\D sid cipher-key-length)
+     :mac-c2s (derive-key k h #\E sid mac-key-length)
+     :mac-s2c (derive-key k h #\F sid mac-key-length))))
+
 ;;;; Main entry point
 
 (defun perform-kex-curve25519 (packet-stream
-                                client-version-octets
-                                server-version-octets
-                                client-kexinit-payload
-                                server-kexinit-payload
-                                session-id
-                                key-verifier
+                                client-version-octets server-version-octets
+                                client-kexinit-payload server-kexinit-payload
+                                session-id key-verifier
                                 &key (iv-length 16)
                                      (cipher-key-length 16)
                                      (mac-key-length 32))
   "Execute the curve25519-sha256 key exchange on PACKET-STREAM.
-
-   CLIENT-VERSION-OCTETS / SERVER-VERSION-OCTETS
-     — identification strings without CRLF, as octet vectors.
-   CLIENT-KEXINIT-PAYLOAD / SERVER-KEXINIT-PAYLOAD
-     — raw bytes of the respective SSH_MSG_KEXINIT messages (msg-type included).
-   SESSION-ID
-     — NIL on the first exchange (H becomes the session-id);
-       on re-exchange pass the original session-id.
-   KEY-VERIFIER
-     — a function (lambda (host-key-blob exchange-hash signature-blob))
-       that must verify the server host-key signature and signal an error
-       on failure.
-
-   Returns a KEX-RESULT struct."
-
-  ;; 1. Generate ephemeral Curve25519 keypair.
-  (let* ((kp-bytes (multiple-value-bind (priv pub)
-                       (ironclad:generate-key-pair :curve25519)
-                     (list (copy-seq (ironclad:curve25519-key-y pub))
-                           (copy-seq (getf (ironclad:destructure-private-key priv) :x)))))
-         (q-c      (coerce (first  kp-bytes) '(simple-array (unsigned-byte 8) (*))))
-         (priv-x   (coerce (second kp-bytes) '(simple-array (unsigned-byte 8) (*))))
-         (priv-key (ironclad:make-private-key :curve25519 :x priv-x :y q-c)))
-
-    ;; 2. Send SSH_MSG_KEX_ECDH_INIT
-    (let ((init-buf (make-write-buffer)))
-      (write-byte*   init-buf +msg-kex-ecdh-init+)
+PACKET-STREAM carries the key-exchange packets.
+CLIENT-VERSION-OCTETS and SERVER-VERSION-OCTETS are identification bytes without CRLF.
+CLIENT-KEXINIT-PAYLOAD and SERVER-KEXINIT-PAYLOAD include their message-type bytes.
+SESSION-ID is NIL on the first exchange or the original identifier on rekey.
+KEY-VERIFIER receives the host-key blob, exchange hash, and signature blob and must signal on failure.
+IV-LENGTH, CIPHER-KEY-LENGTH, and MAC-KEY-LENGTH select the derived byte counts.
+Returns a KEX-RESULT structure."
+  (multiple-value-bind (private-key public-key)
+      (ironclad:generate-key-pair :curve25519)
+    (let ((q-c (ironclad:curve25519-key-y public-key))
+          (init-buf (make-write-buffer)))
+      (write-byte* init-buf +msg-kex-ecdh-init+)
       (write-string* init-buf q-c)
-      (send-packet packet-stream (buffer-to-octets init-buf)))
-
-    ;; 3. Receive SSH_MSG_KEX_ECDH_REPLY.
-    (let* ((reply (recv-packet packet-stream)))
-      (unless (= (aref reply 0) +msg-kex-ecdh-reply+)
-        (error 'ssh-protocol-error
-               :message (format nil "expected ECDH_REPLY (31), got ~D" (aref reply 0))))
-
-      (let* ((rbuf     (make-read-buffer reply :start 1))
-             (k-s-blob (read-string* rbuf))  ; server host key blob
-             (q-s      (read-string* rbuf))  ; server ephemeral public key (32 bytes LE)
-             (sig-blob (read-string* rbuf))) ; signature blob
-
-        ;; RFC 8731 §3: Curve25519 public keys are exactly 32 bytes.
-        (unless (= (length q-s) 32)
+      (send-packet packet-stream (buffer-to-octets init-buf))
+      (let ((reply (recv-packet packet-stream)))
+        (unless (= (aref reply 0) +msg-kex-ecdh-reply+)
           (error 'ssh-protocol-error
-                 :message (format nil "server Curve25519 public key has invalid length ~D" (length q-s))))
-
-        ;; 4. Compute shared secret K
-        (let* ((server-pub (ironclad:make-public-key :curve25519 :y q-s))
-               (shared-le  (ironclad:diffie-hellman priv-key server-pub)))
-
-          ;; RFC 8731 §3 requires aborting on all-zero X25519 output.
-          (when (every #'zerop shared-le)
+                 :message (format nil "expected ECDH_REPLY (31), got ~D" (aref reply 0))))
+        (let* ((rbuf (make-read-buffer reply :start 1))
+               (k-s-blob (read-string* rbuf))
+               (q-s (read-string* rbuf))
+               (sig-blob (read-string* rbuf)))
+          ;; RFC 8731 §3: public keys are exactly 32 bytes.
+          (unless (= (length q-s) 32)
             (error 'ssh-protocol-error
-                   :message "server Curve25519 public key produced an all-zero shared secret"))
-
-          (let ((k (curve25519-bytes->mpint-integer shared-le)))
-
-            ;; 5. Compute exchange hash H.
-            (let* ((h (build-exchange-hash client-version-octets
+                   :message (format nil "server Curve25519 public key has invalid length ~D" (length q-s))))
+          (let* ((server-pub (ironclad:make-public-key :curve25519 :y q-s))
+                 (shared (ironclad:diffie-hellman private-key server-pub)))
+            ;; RFC 8731 §3 requires aborting on all-zero X25519 output.
+            (when (every #'zerop shared)
+              (error 'ssh-protocol-error
+                     :message "server Curve25519 public key produced an all-zero shared secret"))
+            (let* ((k (curve25519-bytes->mpint-integer shared))
+                   (h (build-exchange-hash client-version-octets
                                            server-version-octets
                                            client-kexinit-payload
                                            server-kexinit-payload
                                            k-s-blob q-c q-s k)))
-
-              ;; 6. Verify server host-key signature.
-              ;;    The key-verifier is expected to signal on failure.
               (funcall key-verifier k-s-blob h sig-blob)
-
-              ;; 7. First exchange: H becomes the session identifier
-              (let ((sid (or session-id h)))
-
-                ;; 8. Derive six symmetric keys
-                (make-kex-result
-                 :session-id    sid
-                 :shared-secret k
-                 :exchange-hash h
-                 :iv-c2s  (derive-key k h #\A sid iv-length)
-                 :iv-s2c  (derive-key k h #\B sid iv-length)
-                 :key-c2s (derive-key k h #\C sid cipher-key-length)
-                 :key-s2c (derive-key k h #\D sid cipher-key-length)
-                 :mac-c2s (derive-key k h #\E sid mac-key-length)
-                 :mac-s2c (derive-key k h #\F sid mac-key-length))))))))))
+              (derive-kex-result k h session-id iv-length cipher-key-length mac-key-length))))))))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; DH Group 14 — diffie-hellman-group14-sha256 (RFC 4253 §8, RFC 3526 §3)
@@ -306,73 +274,44 @@
 ;;;; Main entry point
 
 (defun perform-kex-dh-group14 (packet-stream
-                                client-version-octets
-                                server-version-octets
-                                client-kexinit-payload
-                                server-kexinit-payload
-                                session-id
-                                key-verifier
+                                client-version-octets server-version-octets
+                                client-kexinit-payload server-kexinit-payload
+                                session-id key-verifier
                                 &key (iv-length 16)
                                      (cipher-key-length 16)
                                      (mac-key-length 32))
   "Execute the diffie-hellman-group14-sha256 key exchange on PACKET-STREAM.
-
-   Parameters and return value are identical to PERFORM-KEX-CURVE25519;
-   callers can substitute one for the other based on the negotiated algorithm."
-
-  ;; 1. Generate ephemeral DH keypair.
-  (let* ((kp (let ((x (dh-group14-generate-private-key)))
-               (list x (dh-group14-compute-public x))))
-         (x  (first  kp))   ; private key — never sent on the wire
-         (e  (second kp)))  ; public key  — sent as mpint in KEXDH_INIT
-
-    ;; 2. Send SSH_MSG_KEXDH_INIT (msg type 30, same byte as KEX_ECDH_INIT)
-    (let ((init-buf (make-write-buffer)))
-      (write-byte*  init-buf +msg-kex-ecdh-init+)
-      (write-mpint  init-buf e)
-      (send-packet packet-stream (buffer-to-octets init-buf)))
-
-    ;; 3. Receive SSH_MSG_KEXDH_REPLY (msg type 31).
-    (let* ((reply (recv-packet packet-stream)))
+PACKET-STREAM carries the key-exchange packets.
+CLIENT-VERSION-OCTETS and SERVER-VERSION-OCTETS are identification bytes without CRLF.
+CLIENT-KEXINIT-PAYLOAD and SERVER-KEXINIT-PAYLOAD include their message-type bytes.
+SESSION-ID is NIL on the first exchange or the original identifier on rekey.
+KEY-VERIFIER receives the host-key blob, exchange hash, and signature blob and must signal on failure.
+IV-LENGTH, CIPHER-KEY-LENGTH, and MAC-KEY-LENGTH select the derived byte counts.
+Returns a KEX-RESULT structure."
+  (let* ((x (dh-group14-generate-private-key))
+         (e (dh-group14-compute-public x))
+         (init-buf (make-write-buffer)))
+    ;; KEXDH_INIT and KEXDH_REPLY share their message numbers with ECDH.
+    (write-byte* init-buf +msg-kex-ecdh-init+)
+    (write-mpint init-buf e)
+    (send-packet packet-stream (buffer-to-octets init-buf))
+    (let ((reply (recv-packet packet-stream)))
       (unless (= (aref reply 0) +msg-kex-ecdh-reply+)
         (error 'ssh-protocol-error
-               :message (format nil "expected KEXDH_REPLY (31), got ~D"
-                                (aref reply 0))))
-
-      (let* ((rbuf     (make-read-buffer reply :start 1))
-             (k-s-blob (read-string* rbuf))  ; server host-key blob
-             (f        (read-mpint   rbuf))  ; server DH public key (mpint)
-             (sig-blob (read-string* rbuf))) ; signature blob
-
-        ;; 4. Validate f: RFC 4253 §8 requires 1 < f < p-1.
-        (unless (and (> f 1) (< f (1- +dh-group14-p+)))
+               :message (format nil "expected KEXDH_REPLY (31), got ~D" (aref reply 0))))
+      (let* ((rbuf (make-read-buffer reply :start 1))
+             (k-s-blob (read-string* rbuf))
+             (f (read-mpint rbuf))
+             (sig-blob (read-string* rbuf)))
+        ;; RFC 4253 §8 requires 1 < f < p-1.
+        (unless (< 1 f (1- +dh-group14-p+))
           (error 'ssh-protocol-error
                  :message "server DH public key f is out of valid range"))
-
-        ;; 5. Compute shared secret K = f^x mod p.
-        (let* ((k (dh-group14-compute-secret f x)))
-
-          ;; 6. Compute exchange hash H.
-          (let* ((h (build-exchange-hash-dh client-version-octets
-                                             server-version-octets
-                                             client-kexinit-payload
-                                             server-kexinit-payload
-                                             k-s-blob e f k)))
-
-            ;; 7. Verify server host-key signature.
-            (funcall key-verifier k-s-blob h sig-blob)
-
-            ;; 8. First exchange: H becomes the session identifier.
-            (let ((sid (or session-id h)))
-
-              ;; 9. Derive six symmetric keys (RFC 4253 §7.2).
-              (make-kex-result
-               :session-id    sid
-               :shared-secret k
-               :exchange-hash h
-               :iv-c2s  (derive-key k h #\A sid iv-length)
-               :iv-s2c  (derive-key k h #\B sid iv-length)
-               :key-c2s (derive-key k h #\C sid cipher-key-length)
-               :key-s2c (derive-key k h #\D sid cipher-key-length)
-               :mac-c2s (derive-key k h #\E sid mac-key-length)
-               :mac-s2c (derive-key k h #\F sid mac-key-length)))))))))
+        (let* ((k (dh-group14-compute-secret f x))
+               (h (build-exchange-hash-dh client-version-octets
+                                          server-version-octets
+                                          client-kexinit-payload
+                                          server-kexinit-payload
+                                          k-s-blob e f k)))
+          (funcall key-verifier k-s-blob h sig-blob)
+          (derive-kex-result k h session-id iv-length cipher-key-length mac-key-length))))))

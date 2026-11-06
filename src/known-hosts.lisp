@@ -3,8 +3,8 @@
 ;;;; Supports:
 ;;;;   - Plain hostname entries:   hostname key-type base64-key [comment]
 ;;;;   - Hashed hostname entries:  |1|<base64-salt>|<base64-hash> key-type base64-key
-;;;;   - TOFU (trust on first use): add new hosts automatically
-;;;;   - Strict checking: reject changed host keys
+;;;;   - Strict checking: reject unknown and changed host keys
+;;;;   - Policy-controlled TOFU and permissive changed-key updates
 ;;;;
 ;;;; Does not yet support:
 ;;;;   - Multiple hostnames in a single entry (comma-separated)
@@ -13,11 +13,20 @@
 
 (uiop:define-package ssh/known-hosts
   (:use #:cl)
+  (:import-from #:ssh/config)
   (:import-from #:ssh/keys
                 #:public-key-fingerprint
                 #:key-error)
   (:export
+   #:host-key-revoked-error
+   #:host-key-revoked-error-hostname
+   #:host-key-revoked-error-received-fingerprint
    #:check-host-key
+   #:normalize-host-key-policy
+   #:unknown-host-key-error
+   #:unknown-host-key-error-hostname
+   #:unknown-host-key-error-key-type
+   #:unknown-host-key-error-received-fingerprint
    #:host-key-changed-error
    #:host-key-changed-error-hostname
    #:host-key-changed-error-expected-fingerprint
@@ -40,6 +49,33 @@
                      (host-key-changed-error-hostname c)
                      (host-key-changed-error-expected-fingerprint c)
                      (host-key-changed-error-received-fingerprint c)))))
+
+(define-condition unknown-host-key-error (error)
+  ((hostname
+    :initarg :hostname
+    :reader unknown-host-key-error-hostname)
+   (key-type
+    :initarg :key-type
+    :reader unknown-host-key-error-key-type)
+   (received-fingerprint
+    :initarg :received-fingerprint
+    :reader unknown-host-key-error-received-fingerprint))
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "No trusted host key is recorded for ~A (~A). Received fingerprint: ~A. Connection refused."
+             (unknown-host-key-error-hostname condition)
+             (unknown-host-key-error-key-type condition)
+             (unknown-host-key-error-received-fingerprint condition)))))
+
+(define-condition host-key-revoked-error (error)
+  ((hostname :initarg :hostname :reader host-key-revoked-error-hostname)
+   (received-fingerprint :initarg :received-fingerprint
+                         :reader host-key-revoked-error-received-fingerprint))
+  (:report (lambda (condition stream)
+             (format stream "Host key for ~A is revoked (~A). Connection refused."
+                     (host-key-revoked-error-hostname condition)
+                     (host-key-revoked-error-received-fingerprint condition)))))
 
 (define-condition known-hosts-lock-error (error)
   ((path :initarg :path :reader known-hosts-lock-error-path))
@@ -128,51 +164,76 @@
           (ironclad:constant-time-equal hash expected))))))
 
 (defun hostname-matches-entry-p (entry-hostname hostname)
-  "Return true if ENTRY-HOSTNAME (from a known_hosts line) matches HOSTNAME."
-  (or (string-equal entry-hostname hostname)
-      (hashed-hostname-matches-p entry-hostname hostname)))
+  (if (and (plusp (length entry-hostname))
+           (char= (char entry-hostname 0) #\|))
+      (handler-case (hashed-hostname-matches-p entry-hostname hostname)
+        (error () nil))
+      (ssh/config::patterns-match-p
+       (uiop:split-string entry-hostname :separator '(#\,)) hostname)))
+
+(defun canonical-host-key-type (key-type)
+  (if (member key-type '("rsa-sha2-256" "rsa-sha2-512") :test #'string=)
+      "ssh-rsa"
+      key-type))
 
 ;;;; Known hosts file parsing
 
 (defstruct known-hosts-entry
-  raw-hostname   ; the string as it appears in the file
-  key-type       ; e.g. "ssh-ed25519"
-  key-blob       ; raw decoded octet vector
-  comment)       ; may be NIL
+  raw-hostname
+  key-type
+  key-blob
+  comment
+  marker)
+
+; may be NIL
 
 (defun parse-known-hosts-line (line)
-  "Parse one line from known_hosts.  Returns a KNOWN-HOSTS-ENTRY or NIL
-   if the line is blank, a comment, or unrecognised."
-  (let ((trimmed (string-trim '(#\Space #\Tab) line)))
-    (when (or (zerop (length trimmed))
-              (char= (char trimmed 0) #\#))
+  (let* ((trimmed (string-trim '(#\Space #\Tab) line))
+         (tokens (remove "" (uiop:split-string trimmed :separator '(#\Space #\Tab))
+                         :test #'string=))
+         (marker nil))
+    (when (or (null tokens) (char= (char (first tokens) 0) #\#))
       (return-from parse-known-hosts-line nil))
-    ;; Skip @marker lines (cert-authority / revoked)
-    (when (char= (char trimmed 0) #\@)
-      (return-from parse-known-hosts-line nil))
-    (let ((tokens (loop for start = 0 then (1+ end)
-                        for end   = (position-if (lambda (c) (member c '(#\Space #\Tab)))
-                                                  trimmed :start start)
-                        for tok   = (subseq trimmed start (or end (length trimmed)))
-                        unless (zerop (length tok)) collect tok
-                        while end)))
-      (when (>= (length tokens) 3)
-        (make-known-hosts-entry
-         :raw-hostname (first tokens)
-         :key-type     (second tokens)
-         :key-blob     (handler-case (base64-decode (third tokens))
-                         (error () (return-from parse-known-hosts-line nil)))
-         :comment      (when (>= (length tokens) 4) (fourth tokens)))))))
+    (when (char= (char (first tokens) 0) #\@)
+      (unless (string= (pop tokens) "@revoked")
+        (return-from parse-known-hosts-line nil))
+      (setf marker :revoked))
+    (when (>= (length tokens) 3)
+      (make-known-hosts-entry
+       :raw-hostname (first tokens)
+       :key-type (canonical-host-key-type (second tokens))
+       :key-blob (handler-case (base64-decode (third tokens))
+                   (error () (return-from parse-known-hosts-line nil)))
+       :comment (fourth tokens)
+       :marker marker))))
 
 (defun load-known-hosts (path)
   "Read PATH and return a list of KNOWN-HOSTS-ENTRY structures."
   (unless (probe-file path)
     (return-from load-known-hosts '()))
-  (with-open-file (f path :direction :input)
-    (loop for line = (read-line f nil nil)
-          while line
-          for entry = (parse-known-hosts-line line)
-          when entry collect entry)))
+  (with-open-file (stream path
+                          :direction :input
+                          :element-type '(unsigned-byte 8))
+    (let* ((octets (make-array (file-length stream)
+                               :element-type '(unsigned-byte 8)))
+           (octet-count (read-sequence octets stream)))
+      (loop for start = 0 then (1+ newline)
+            while (<= start octet-count)
+            for newline = (position #x0a octets :start start :end octet-count)
+            for raw-end = (or newline octet-count)
+            for end = (if (and (> raw-end start)
+                               (= (aref octets (1- raw-end)) #x0d))
+                          (1- raw-end)
+                          raw-end)
+            for line = (handler-case
+                           (babel:octets-to-string octets
+                                                  :encoding :utf-8
+                                                  :start start
+                                                  :end end)
+                         (babel-encodings:character-decoding-error () nil))
+            for entry = (and line (parse-known-hosts-line line))
+            when entry collect entry
+            while newline))))
 
 ;;;; Appending a new entry (TOFU)
 
@@ -231,35 +292,42 @@
 
 (defun update-known-hosts-unlocked (path hostname key-type key-blob)
   (let ((staging (merge-pathnames
-                  (format nil ".~A.tmp" (gensym "KNOWN-HOSTS-"))
-                  path)))
+                  (format nil ".~A.tmp" (gensym "KNOWN-HOSTS-")) path)))
     (unwind-protect
          (progn
            (with-open-file (in path :direction :input)
              (with-open-file (out staging :direction :output
                                           :if-exists :supersede
                                           :if-does-not-exist :create)
-               (loop for line = (read-line in nil nil)
-                     while line
-                     for entry = (parse-known-hosts-line line)
-                     do (if (and entry
-                                 (hostname-matches-entry-p
-                                  (known-hosts-entry-raw-hostname entry) hostname)
-                                 (string= (known-hosts-entry-key-type entry)
-                                          key-type))
-                            (write-line (known-hosts-entry->line
-                                         (make-known-hosts-entry
-                                          :raw-hostname (known-hosts-entry-raw-hostname entry)
-                                          :key-type (known-hosts-entry-key-type entry)
-                                          :key-blob key-blob
-                                          :comment (known-hosts-entry-comment entry)))
-                                        out)
-                            (write-line line out)))))
+               (let ((written nil))
+                 (loop for line = (read-line in nil nil)
+                       while line
+                       for entry = (parse-known-hosts-line line)
+                       do (cond
+                            ((and entry
+                                  (null (known-hosts-entry-marker entry))
+                                  (hostname-matches-entry-p
+                                   (known-hosts-entry-raw-hostname entry) hostname)
+                                  (string= (known-hosts-entry-key-type entry) key-type))
+                             (let ((pattern (known-hosts-entry-raw-hostname entry)))
+                               (cond
+                                 ((or (string-equal pattern hostname)
+                                      (char= (char pattern 0) #\|))
+                                  (setf (known-hosts-entry-key-blob entry) key-blob)
+                                  (write-line (known-hosts-entry->line entry) out)
+                                  (setf written t))
+                                 (t
+                                  ;; Retain a shared pin for its other hosts.
+                                  (setf (known-hosts-entry-raw-hostname entry)
+                                        (format nil "~A,!~A" pattern hostname))
+                                  (write-line (known-hosts-entry->line entry) out)))))
+                            (t (write-line line out))))
+                 (unless written
+                   (format out "~A ~A ~A~%" hostname key-type (base64-encode key-blob))))))
            (uiop:rename-file-overwriting-target staging path)
            (setf staging nil))
       (when staging
-        (ignore-errors
-         (delete-file staging))))))
+        (ignore-errors (delete-file staging))))))
 
 (defun update-known-hosts (path hostname key-type key-blob)
   "Rewrite matching known_hosts entries at PATH with KEY-BLOB."
@@ -270,70 +338,98 @@
 
 ;;;; Main entry point
 
-(defun check-host-key-unlocked (hostname key-type host-key-blob known-hosts-path strict)
+(defun normalize-host-key-policy (value)
+  "Normalize VALUE to a host-key checking policy.
+VALUE accepts T or :YES for strict checking, NIL or :NO for permissive
+checking, and :ACCEPT-NEW for trust on first use without changed-key updates.
+The configuration sentinels :UNSET, :DEFAULT, and :ASK select strict checking.
+Returns :YES, :ACCEPT-NEW, or :NO."
+  (cond
+    ((member value '(t :yes :unset :default :ask)) :yes)
+    ((member value '(nil :no)) :no)
+    ((eq value :accept-new) :accept-new)
+    (t
+     (error "Invalid strict host-key checking policy: ~S" value))))
+
+(defun check-host-key-unlocked
+    (hostname key-type host-key-blob known-hosts-path policy)
   (let ((entries (load-known-hosts known-hosts-path))
         (received-fp (public-key-fingerprint host-key-blob)))
-    ;; Find all entries for this hostname and key type
-    (let ((matches (remove-if-not
-                    (lambda (e)
-                      (and (hostname-matches-entry-p (known-hosts-entry-raw-hostname e) hostname)
-                           (string= (known-hosts-entry-key-type e) key-type)))
-                    entries)))
+    (let ((matches
+            (remove-if-not
+             (lambda (entry)
+               (and
+                (hostname-matches-entry-p
+                 (known-hosts-entry-raw-hostname entry)
+                 hostname)
+                (string= (known-hosts-entry-key-type entry) key-type)))
+             entries)))
+      ;; A matching revocation overrides every positive pin and every policy.
+      (when (some (lambda (entry)
+                    (and (eq :revoked (known-hosts-entry-marker entry))
+                         (ironclad:constant-time-equal
+                          (known-hosts-entry-key-blob entry) host-key-blob)))
+                  matches)
+        (error 'host-key-revoked-error :hostname hostname
+               :received-fingerprint received-fp))
+      (setf matches (remove-if #'known-hosts-entry-marker matches))
       (cond
-        ;; No entry for this host+type: TOFU
         ((null matches)
-         (format *error-output*
-                 "~&Warning: permanently added '~A' (~A) to the list of known hosts.~%"
-                 hostname key-type)
-         (add-known-host-unlocked known-hosts-path hostname key-type host-key-blob)
-         :accepted-tofu)
-
-        ;; At least one entry exists — check if any matches the received key
-        ((some (lambda (e)
-                 (ironclad:constant-time-equal (known-hosts-entry-key-blob e) host-key-blob))
-               matches)
+         (if (eq policy :yes)
+             (error 'unknown-host-key-error
+                    :hostname hostname
+                    :key-type key-type
+                    :received-fingerprint received-fp)
+             (progn
+               (format
+                *error-output*
+                "~&Warning: permanently added '~A' (~A) to the list of known hosts.~%"
+                hostname key-type)
+               (add-known-host-unlocked
+                known-hosts-path hostname key-type host-key-blob)
+               :accepted-tofu)))
+        ((some
+          (lambda (entry)
+            (ironclad:constant-time-equal
+             (known-hosts-entry-key-blob entry)
+             host-key-blob))
+          matches)
          :accepted-known)
-
-        ;; Entry exists but key differs
         (t
-         (let ((expected-fp (public-key-fingerprint
-                             (known-hosts-entry-key-blob (first matches)))))
-           (if strict
+         (let ((expected-fp
+                 (public-key-fingerprint
+                  (known-hosts-entry-key-blob (first matches)))))
+           (if (eq policy :no)
+               (progn
+                 (format
+                  *error-output*
+                  "~&Warning: host key for '~A' has changed.~%~
+                    Expected: ~A~%~
+                    Received: ~A~%~
+                    Proceeding (strict checking is disabled).~%"
+                  hostname expected-fp received-fp)
+                 (update-known-hosts-unlocked
+                  known-hosts-path hostname key-type host-key-blob)
+                 :accepted-changed)
                (error 'host-key-changed-error
                       :hostname hostname
                       :expected-fingerprint expected-fp
-                      :received-fingerprint received-fp)
-               (progn
-                 (format *error-output*
-                         "~&Warning: host key for '~A' has changed.~%~
-                           Expected: ~A~%~
-                           Received: ~A~%~
-                           Proceeding (strict checking is disabled).~%"
-                         hostname expected-fp received-fp)
-                 (update-known-hosts-unlocked known-hosts-path hostname key-type host-key-blob)
-                 :accepted-changed))))))))
+                      :received-fingerprint received-fp))))))))
 
-(defun check-host-key (hostname key-type host-key-blob
-                       &key (known-hosts-path (default-known-hosts-path))
-                         (strict t))
-  "Verify HOST-KEY-BLOB against the known_hosts file.
-
-   HOSTNAME         — the server hostname string
-   KEY-TYPE         — the negotiated host-key algorithm string
-   HOST-KEY-BLOB    — the server's raw public key blob bytes
-   KNOWN-HOSTS-PATH — pathname to the known_hosts file
-   STRICT           — if true (default), reject changed keys; if false,
-                      only warn and accept the new key
-
-   Behaviour:
-     - If the host is not known: TOFU — add it and proceed.
-     - If the host is known with the same key: accept.
-     - If the host is known with a different key: signal HOST-KEY-CHANGED-ERROR
-       (when STRICT) or warn and update the entry (when not STRICT).
-
-   Returns :accepted-known, :accepted-tofu, or :accepted-changed."
-  (call-with-known-hosts-lock
-   known-hosts-path
-   (lambda ()
-     (check-host-key-unlocked hostname key-type host-key-blob
-                              known-hosts-path strict))))
+(defun check-host-key
+    (hostname key-type host-key-blob
+     &key (known-hosts-path (default-known-hosts-path)) (strict :yes))
+  "Verify HOST-KEY-BLOB according to the selected known_hosts policy.
+HOSTNAME is the server hostname string.
+KEY-TYPE is the key format or negotiated algorithm; RSA SHA-2 uses ssh-rsa pins.
+Matching @revoked entries are rejected under every policy.
+HOST-KEY-BLOB is the server's raw public key blob.
+KNOWN-HOSTS-PATH names the known_hosts file.
+STRICT accepts :YES/T, :ACCEPT-NEW, or :NO/NIL.
+Returns :ACCEPTED-KNOWN, :ACCEPTED-TOFU, or :ACCEPTED-CHANGED."
+  (let ((policy (normalize-host-key-policy strict)))
+    (call-with-known-hosts-lock
+     known-hosts-path
+     (lambda ()
+       (check-host-key-unlocked
+        hostname (canonical-host-key-type key-type) host-key-blob known-hosts-path policy)))))

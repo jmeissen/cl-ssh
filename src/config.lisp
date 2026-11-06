@@ -19,6 +19,7 @@
 (uiop:define-package :ssh/config
   (:use :cl)
   (:export
+   #:*default-config-path*
    #:resolve-host
    #:ssh-config
    #:ssh-config-hostname
@@ -31,6 +32,8 @@
    #:ssh-config-rekey-seconds-limit))
 
 (in-package :ssh/config)
+
+(defvar *default-config-path* (merge-pathnames #p".ssh/config" (user-homedir-pathname)))
 
 ;;;; Result struct
 
@@ -46,9 +49,6 @@
   (rekey-seconds-limit  :unset))  ; integer, NIL, or :UNSET
 
 ;;;; Helpers
-
-(defun default-config-path ()
-  (merge-pathnames #p".ssh/config" (user-homedir-pathname)))
 
 (defun expand-tilde (s)
   "Expand a leading ~ to the user home directory."
@@ -199,16 +199,37 @@ Returns (values limit validp)."
                      blocks)
                (setf current-patterns nil
                      current-settings nil))))
-      (with-open-file (f path :direction :input)
-        (loop for line = (read-line f nil nil)
-              while line
-              for kv = (parse-kv line)
-              when kv
-                do (if (string= (car kv) "HOST")
-                       (progn
-                         (flush)
-                         (setf current-patterns (split-whitespace (cdr kv))))
-                       (push kv current-settings))))
+      (with-open-file (stream path
+                              :direction :input
+                              :element-type '(unsigned-byte 8))
+        (let* ((octets (make-array (file-length stream)
+                                   :element-type '(unsigned-byte 8)))
+               (octet-count (read-sequence octets stream)))
+          (loop for start = 0 then (1+ newline)
+                while (<= start octet-count)
+                for newline = (position #x0a octets
+                                        :start start
+                                        :end octet-count)
+                for raw-end = (or newline octet-count)
+                for end = (if (and (> raw-end start)
+                                   (= (aref octets (1- raw-end)) #x0d))
+                              (1- raw-end)
+                              raw-end)
+                for line = (handler-case
+                               (babel:octets-to-string octets
+                                                      :encoding :utf-8
+                                                      :start start
+                                                      :end end)
+                             (babel-encodings:character-decoding-error () nil))
+                for kv = (and line (parse-kv line))
+                when kv
+                  do (if (string= (car kv) "HOST")
+                         (progn
+                           (flush)
+                           (setf current-patterns
+                                 (split-whitespace (cdr kv))))
+                         (push kv current-settings))
+                while newline)))
       (flush))
     (nreverse blocks)))
 
@@ -259,7 +280,7 @@ Returns (values limit validp)."
 
 ;;;; Public entry point
 
-(defun resolve-host (alias &key (config-path (default-config-path)))
+(defun resolve-host (alias &key (config-path *default-config-path*))
   "Look up ALIAS in the SSH config file and return an SSH-CONFIG struct.
 
    Settings are accumulated across all matching Host blocks in file order

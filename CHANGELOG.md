@@ -1,8 +1,20 @@
 # Changelog
 
-## [Unreleased]
+All notable changes are recorded here, following
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [1.0.0] - 2026-10-25
 
 ### Added
+- Concurrent command, shell, subsystem, and SFTP channels over one authenticated
+  connection, with a shared dispatcher and independent channel flow control.
+- SFTP v3 file/directory operations, binary remote-file streams, and pipelined
+  uploads/downloads with progress callbacks; OpenSSH `limits`, `posix-rename`,
+  and `fsync` extensions, plus selectable symlink argument order.
+- Optional streaming `zlib` compression, RFC 8308 `delay-compression`, and
+  OpenSSH delayed-zlib interoperability.
+- GitHub and Forgejo CI for SBCL/ECL, integration tests, parser fuzzing, and
+  secret scanning; signed-tag release evidence and user/developer guides.
 - AES-128-GCM and AES-256-GCM packet protection using both the RFC 5647
   `AEAD_AES_*_GCM` names and the common `aes*-gcm@openssh.com` names.
 - Honor `RekeyLimit` configuration and expose `ssh:connect`
@@ -15,7 +27,37 @@
   key authentication selection (RFC 8308 §3.1)
 - Integration tests through Docker and an additional integration testing system.
 
+### Changed
+
+- **Breaking:** shell/subsystem streams reclaim consumed input and replenish
+  receive windows on consumption. Buffer accessors return copies of unread bytes;
+  their `setf` places are removed. Drain both stdout and stderr in streaming mode.
+  Pass `:capture-output t` to retain full history (with unbounded memory use);
+  `run-command` retains its complete-output behavior.
+- `open-shell` and `open-subsystem` return a third value, an input-only stderr
+  stream. Closing it retains a bounded diagnostic tail. SFTP likewise keeps
+  stderr separate from protocol data, with a 64 KiB tail and truncation reporting.
+
+### Security
+
+- Strict host-key checking by default, unconditional rejection of matching
+  `@revoked` keys, and RSA-SHA2 verification against ordinary `ssh-rsa` pins.
+  Host lists/wildcards are supported and shared pins survive single-host updates.
+  RSA-SHA1 client signatures require explicit opt-in.
+- OpenSSH strict key exchange, with handshake-message validation and directional
+  sequence resets after NEWKEYS, including rekeys.
+- Hardened malformed key/config/host-file parsing and keyboard-interactive CLI
+  prompts: terminal controls are escaped and hidden prompts require an explicit
+  no-echo reader.
+
 ### Fixed
+- Release sockets, control sockets, channels, and subsystem streams when transport,
+  authentication, dispatcher, or session setup fails or unwinds; preserve the
+  original error and keep unrelated channels usable.
+- Dispatcher responsiveness during idle traffic, rekeying, and concurrent reads
+  and writes; unread channel streams no longer block unrelated channels.
+- Failed assertions now make both ASDF test systems exit unsuccessfully, with
+  ECL-compatible test fixtures and regression checks for the failure exit status.
 - Plain `known_hosts` hostnames now match case-insensitively when checking the local
   host name-to-key db because DNS is case-insensitive (RFC 1035 §2.3.3 ¶1)
 - `known_hosts` additions and stale-key replacement now use a lock.

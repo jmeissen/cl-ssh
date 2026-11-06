@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master, dev]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: Core (${{ matrix.implementation }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        implementation: [sbcl-bin, ecl]
+    env:
+      LISP: ${{ matrix.implementation }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-lisp
+      - run: qlot install
+      - name: Compile and run portable tests
+        run: |
+          qlot exec ros -Q -e \
+            '(progn
+               (asdf:compile-system :ssh :force t)
+               (asdf:test-system :ssh))'
+
+  lint:
+    name: Lisp lint
+    runs-on: ubuntu-latest
+    env:
+      LISP: sbcl-bin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-lisp
+      - run: qlot install
+      - run: qlot exec ros install cxxxr/sblint
+      - run: qlot exec sblint ssh.asd
+
+  integration:
+    name: Docker integration
+    runs-on: ubuntu-latest
+    env:
+      LISP: sbcl-bin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-lisp
+      - run: qlot install
+      - name: Install integration test prerequisites
+        run: |
+          if ! command -v ssh-keyscan >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends openssh-client
+          fi
+      - run: bash scripts/run-integration-tests.sh
+
+  fuzz-replay:
+    name: Fuzz corpus replay
+    runs-on: ubuntu-latest
+    env:
+      LISP: sbcl-bin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-lisp
+      - run: qlot install
+      - run: bash scripts/test-fuzz-driver.sh
+      - run: bash scripts/run-fuzz.sh replay
+      - run: bash scripts/run-fuzz.sh verify
+      - run: bash scripts/run-fuzz.sh coverage
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-coverage
+          path: .fuzz-output/coverage
+          include-hidden-files: true
+          if-no-files-found: error
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan repository history
+        uses: docker://ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f # v8.30.1
+        with:
+          args: git --config .gitleaks.toml --redact --verbose .

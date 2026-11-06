@@ -1,3 +1,7 @@
 .qlot
 tests/fixtures/kex-exchange/kex-capture.jrn
 .sessions
+.fuzz-output
+coverage
+dist
+.DS_Store

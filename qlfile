@@ -3,3 +3,5 @@ ql parachute
 ql trivial-gray-streams
 ql usocket
 ql babel
+ultralisp sionescu-bordeaux-threads
+ultralisp sharplispers-nibbles

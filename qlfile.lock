@@ -22,3 +22,11 @@
  (:class qlot/source/ql:source-ql
   :initargs (:%version :latest)
   :version "ql-2026-01-01"))
+("sionescu-bordeaux-threads" .
+ (:class qlot/source/ultralisp:source-ultralisp
+  :initargs (:%version :latest)
+  :version "ultralisp-20260728091000"))
+("sharplispers-nibbles" .
+ (:class qlot/source/ultralisp:source-ultralisp
+  :initargs (:%version :latest)
+  :version "ultralisp-20260711130500"))

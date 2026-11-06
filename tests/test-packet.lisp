@@ -9,6 +9,7 @@
     #:recv-packet
     #:install-keys
     #:install-gcm-keys
+    #:install-compression
     #:make-hmac-mac-fn
     #:ssh-protocol-error))
 
@@ -21,6 +22,9 @@
   ((buffer   :initform (make-array 4096 :element-type '(unsigned-byte 8)
                                         :adjustable t :fill-pointer 0))
    (read-pos :initform 0)))
+
+(defmethod stream-element-type ((s pipe-stream))
+  '(unsigned-byte 8))
 
 (defmethod stream-read-byte ((s pipe-stream))
   (with-slots (buffer read-pos) s
@@ -57,6 +61,16 @@
          (payload (octets 10 1 2 3 4 5)))
     (send-packet ps payload)
     (is equalp payload (recv-packet ps))))
+
+(define-test cleartext-rejects-oversized-packet-before-allocation
+  :parent (:ssh/tests ssh/tests)
+  (let* ((pipe (make-pipe))
+         (ps (make-packet-stream pipe)))
+    (write-sequence (octets 255 255 255 255 0 0 0 0) pipe)
+    (of-type 'ssh-protocol-error
+      (handler-case
+          (progn (recv-packet ps) nil)
+        (ssh-protocol-error (condition) condition)))))
 
 (define-test cleartext-empty-payload
   :parent (:ssh/tests ssh/tests)
@@ -104,6 +118,51 @@
       (send-packet ps (octets i)))
     (dotimes (i 10)
       (is equalp (octets i) (recv-packet ps)))))
+
+(define-test zlib-compresses-payload-before-packet-framing
+  :parent (:ssh/tests ssh/tests)
+  (let* ((pipe (make-pipe))
+         (ps (make-packet-stream pipe))
+         (payload (make-array 2000
+                              :element-type '(unsigned-byte 8)
+                              :initial-element 65)))
+    (setf (aref payload 0) 94)
+    (install-compression ps :out "zlib" :in "zlib")
+    (send-packet ps payload)
+    (true (< (length (pipe-buffer pipe)) (length payload)))
+    (is equalp payload (recv-packet ps))))
+
+(define-test classic-encryption-and-mac-roundtrip-compressed-payload
+  :parent (:ssh/tests ssh/tests)
+  (let* ((pipe (make-pipe))
+         (ps (make-packet-stream pipe))
+         (key (make-array 16 :element-type '(unsigned-byte 8)
+                             :initial-element 11))
+         (iv (make-array 16 :element-type '(unsigned-byte 8)
+                            :initial-element 12))
+         (mac-key (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 13))
+         (payload (make-array 12000
+                              :element-type '(unsigned-byte 8)
+                              :initial-element 65)))
+    (setf (aref payload 0) 94)
+    (install-keys
+     ps
+     :cipher-out (ironclad:make-cipher :aes :mode :ctr
+                                            :key key
+                                            :initialization-vector iv)
+     :cipher-in (ironclad:make-cipher :aes :mode :ctr
+                                           :key key
+                                           :initialization-vector (copy-seq iv))
+     :block-size-out 16
+     :block-size-in 16
+     :mac-out (make-hmac-mac-fn mac-key :sha256)
+     :mac-in (make-hmac-mac-fn mac-key :sha256)
+     :mac-length-out 32
+     :mac-length-in 32)
+    (install-compression ps :out "zlib" :in "zlib")
+    (send-packet ps payload)
+    (is equalp payload (recv-packet ps))))
 
 ;;; ---- sequence number wrapping ------------------------------------------
 
@@ -226,6 +285,22 @@
     (is equalp (octets 94 4 5 6) (recv-packet ps))
     (is = 2 (ssh/packet:packet-stream-seq-out ps))
     (is = 2 (ssh/packet:packet-stream-seq-in ps))))
+
+(define-test aes-gcm-roundtrip-compressed-payload
+  :parent (:ssh/tests ssh/tests)
+  (let* ((pipe (make-pipe))
+         (ps (make-packet-stream pipe))
+         (key (octets 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15))
+         (iv (octets 16 17 18 19 20 21 22 23 24 25 26 27))
+         (payload (make-array 12000
+                              :element-type '(unsigned-byte 8)
+                              :initial-element 66)))
+    (setf (aref payload 0) 94)
+    (install-gcm-keys ps :key-out key :iv-out iv
+                         :key-in key :iv-in iv)
+    (install-compression ps :out "zlib" :in "zlib")
+    (send-packet ps payload)
+    (is equalp payload (recv-packet ps))))
 
 (define-test aes-gcm-wire-format-leaves-length-as-aad
   :parent (:ssh/tests ssh/tests)

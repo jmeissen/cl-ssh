@@ -1,0 +1,50 @@
+name: Set up Common Lisp for GitHub
+description: Install Common Lisp and verify the commands required by the selected implementation.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Common Lisp toolchain
+      uses: 40ants/setup-lisp@76212e4597c780ad0e2ead24144b54310dffb6e3 # v4
+
+    - name: Ensure SBCL command is available
+      if: env.LISP == 'sbcl' || env.LISP == 'sbcl-bin'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v sbcl >/dev/null 2>&1; then
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes sbcl
+          else
+            apt-get update
+            apt-get install --yes sbcl
+          fi
+        fi
+
+    - name: Verify selected Lisp implementation
+      shell: bash
+      run: |
+        set -euo pipefail
+        export PATH="${HOME}/.roswell/bin:${HOME}/.roswell/lisp/quicklisp/bin:${PATH}"
+
+        case "${LISP:?LISP must select a Common Lisp implementation}" in
+          sbcl|sbcl-bin)
+            expected=SBCL
+            ;;
+          ecl)
+            expected=ECL
+            ;;
+          *)
+            echo "Unsupported LISP value: ${LISP}" >&2
+            exit 64
+            ;;
+        esac
+
+        EXPECTED_LISP="${expected}" ros -Q -e \
+          '(let ((expected (uiop:getenv "EXPECTED_LISP"))
+                 (actual (lisp-implementation-type)))
+             (unless (string-equal actual expected)
+               (error "Expected ~A for LISP=~A, got ~A." expected
+                      (uiop:getenv "LISP") actual))
+             (format t "Using ~A for LISP=~A.~%" actual (uiop:getenv "LISP")))'

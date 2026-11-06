@@ -16,8 +16,7 @@
   (:import-from :ssh/kex
                 #:+dh-group14-p+
                 #:+dh-group14-g+
-                #:build-exchange-hash-dh
-                #:derive-key))
+                #:build-exchange-hash-dh))
 
 (in-package :ssh/tests/kex-dh)
 
@@ -54,15 +53,12 @@
 
 (define-test dh-group14-modexp-known-value
   :parent (:ssh/tests ssh/tests)
-  "Verify g^x mod p against a hand-computed small-prime reference.
-   Using the toy group p=23, g=2: 2^10 mod 23 = 1024 mod 23 = 1024 - 44*23 = 12."
-  ;; 44 * 23 = 1012, 1024 - 1012 = 12
-  (is = 12 (ironclad:expt-mod 2 10 23))
-  ;; Also: 2^3 mod 23 = 8, 2^5 mod 23 = 32 mod 23 = 9
-  ;; Commutativity: 9^3 mod 23 = 729 mod 23 = 729 - 31*23 = 729 - 713 = 16
-  ;;                8^5 mod 23 = 32768 mod 23 = 32768 - 1424*23 = 16
-  (is = 16 (ironclad:expt-mod 9 3 23))
-  (is = 16 (ironclad:expt-mod 8 5 23)))
+  ;; Exercise our DH helpers with a hand-computed toy group.
+  (let ((+dh-group14-p+ 23)
+        (+dh-group14-g+ 2))
+    (is = 12 (pub 10))
+    (is = 16 (secret 9 3))
+    (is = 16 (secret 8 5))))
 
 ;;; ---- Public key range ------------------------------------------------------
 
@@ -102,19 +98,6 @@
 
 ;;; ---- Exchange hash ---------------------------------------------------------
 
-(define-test dh-exchange-hash-length
-  :parent (:ssh/tests ssh/tests)
-  "SHA-256 exchange hash is exactly 32 bytes."
-  (let ((h (build-exchange-hash-dh *v-c* *v-s* *i-c* *i-s* *k-s* 42 99 1234)))
-    (is = 32 (length h))))
-
-(define-test dh-exchange-hash-deterministic
-  :parent (:ssh/tests ssh/tests)
-  "Same inputs always produce the same hash."
-  (let ((h1 (build-exchange-hash-dh *v-c* *v-s* *i-c* *i-s* *k-s* 42 99 1234))
-        (h2 (build-exchange-hash-dh *v-c* *v-s* *i-c* *i-s* *k-s* 42 99 1234)))
-    (is equalp h1 h2)))
-
 (define-test dh-exchange-hash-sensitive-to-each-field
   :parent (:ssh/tests ssh/tests)
   "Changing any single input field must change the hash."
@@ -143,71 +126,30 @@
 
 (define-test dh-exchange-hash-uses-mpint-not-string-encoding
   :parent (:ssh/tests ssh/tests)
-  "build-exchange-hash-dh encodes e and f as SSH mpints, not SSH strings.
-   The ECDH path (build-exchange-hash) encodes them as SSH strings.
-   With identical 'logical' inputs the two hashes must differ."
-  ;; Use a small integer that could be misread as byte-count if encoded wrong.
-  ;; build-exchange-hash takes e and f as raw octet vectors (SSH strings).
-  ;; build-exchange-hash-dh takes them as CL integers (mpints).
-  ;; We construct a raw vector that looks like the string encoding of 42,
-  ;; then confirm the two hashes differ.
-  (let* ((e-int 42)
-         (f-int 99)
-         ;; 4-byte big-endian length + single byte: SSH string encoding of #(42)
-         (e-str (octets 0 0 0 1 42))
-         (f-str (octets 0 0 0 1 99))
-         (hash-dh   (build-exchange-hash-dh *v-c* *v-s* *i-c* *i-s* *k-s*
-                                            e-int f-int 1234))
-         (hash-ecdh (ssh/kex:build-exchange-hash *v-c* *v-s* *i-c* *i-s* *k-s*
-                                                 e-str f-str 1234)))
-    (false (equalp hash-dh hash-ecdh)
-           "DH and ECDH exchange hashes must differ (different e/f encoding)")))
+  ;; Independently hashed RFC 4253 transcript. Positive E, F and K all need
+  ;; mpint sign padding: 00 80, 00 ff and 00 80 00 respectively.
+  (is equalp
+      (ironclad:hex-string-to-byte-array
+       "de491f369f05d5880a0e176ea7479c28597242e2699f62c8b677a26481de6db3")
+      (build-exchange-hash-dh *v-c* *v-s* *i-c* *i-s* *k-s* #x80 #xff #x8000)))
 
 ;;; ---- Full in-process two-party exchange -----------------------------------
 
-(define-test dh-group14-full-exchange-derives-matching-keys
+(define-test dh-group14-exchanges-signed-packets-on-rekey
   :parent (:ssh/tests ssh/tests)
-  "Simulate a complete DH group14 exchange between two parties in-process.
-   Both sides must derive identical K, H, and key material."
-  (let* (;; Both parties generate independent keypairs
-         (x-client (gen-private))
-         (x-server (gen-private))
-         (e (pub x-client))   ; client sends e
-         (f (pub x-server))   ; server sends f
-
-         ;; Both compute the shared secret independently
-         (k-client (secret f x-client))    ; f^x_c mod p
-         (k-server (secret e x-server))    ; e^x_s mod p
-
-         ;; Shared secret must be identical
-         (k k-client))
-
-    (is = k-client k-server "both parties must derive the same shared secret")
-
-    ;; Both parties compute the exchange hash with the same inputs
-    (let* ((h (build-exchange-hash-dh *v-c* *v-s* *i-c* *i-s* *k-s* e f k))
-           (sid h))
-
-      (is = 32 (length h) "exchange hash is 32 bytes")
-
-      ;; Derive keys for aes256-ctr + hmac-sha2-512
-      (let ((iv-c2s  (derive-key k h #\A sid 16))
-            (iv-s2c  (derive-key k h #\B sid 16))
-            (key-c2s (derive-key k h #\C sid 32))
-            (key-s2c (derive-key k h #\D sid 32))
-            (mac-c2s (derive-key k h #\E sid 64))
-            (mac-s2c (derive-key k h #\F sid 64)))
-
-        (is = 16 (length iv-c2s)  "IV c2s is 16 bytes")
-        (is = 16 (length iv-s2c)  "IV s2c is 16 bytes")
-        (is = 32 (length key-c2s) "cipher key c2s is 32 bytes (aes256)")
-        (is = 32 (length key-s2c) "cipher key s2c is 32 bytes (aes256)")
-        (is = 64 (length mac-c2s) "MAC key c2s is 64 bytes (hmac-sha2-512)")
-        (is = 64 (length mac-s2c) "MAC key s2c is 64 bytes (hmac-sha2-512)")
-
-        ;; All six derived values must be distinct
-        (let ((all-keys (list iv-c2s iv-s2c key-c2s key-s2c mac-c2s mac-s2c)))
-          (loop for (a . rest) on all-keys
-                do (loop for b in rest
-                         do (false (equalp a (subseq b 0 (length a)))
-                                   "derived keys must be distinct"))))))))
+  ;; Independent RFC 4253 vectors: x = 127, y = 255, fixture Ed25519 host key.
+  ;; The public mpints need leading zero bytes; the original session ID is retained.
+  ;; Intercept the external RNG call: ECL can compile calls to the
+  ;; same-file private-key helper directly, bypassing SYMBOL-FUNCTION.
+  ;; The real helper adds 2, so this still exercises private exponent 127.
+  (ssh/tests/kex::check-kex-wire-exchange
+   #'ssh/kex:perform-kex-dh-group14 'ironclad:strong-random '(125)
+   #'ssh/buffer:write-mpint (ash 1 255) (octets 9 8 7)
+   "1e000000110080000000000000000000000000000000"
+   "23f0281bdc1a443e7545375435ad66496179d3bb4a608ee56fcd8760347b72e5"
+   '("5aa3bf79a7c3bf134eee84f6"
+     "86c56e3a1225bbce39486a25"
+     "38d17a30300a0ccce3131459fb69ea8bb6863756e665179bd20eefa9bdad6a10"
+     "b1583ba2776fd53e39e1d75271da3bb908e7c7366d7db2ef0ddc783f57a4e420"
+     "a96abc111cfcc8733e6fc33c424e424526fad41f49be93239fec6d46f4f268031522f4b76ef03b851766a8716b5fd5f3fde75a8eb1fcc4ef03cf322ccc5c3e6a"
+     "e10a3ecc064c62106ea6969f689cfe55a94b3fe1a1bab09df02747b2713bddf3c585396736736f3636abeac4d0cbc72e0614379ae7bc63c65c82beb333410d15")))
